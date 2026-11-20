@@ -1,0 +1,10 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+
+# Default AzureHound export path: a full tenant dump, never commit it
+azurehound.json
