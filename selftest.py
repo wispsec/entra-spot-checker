@@ -179,6 +179,36 @@ def regressions():
                graph=lambda *a, **k: {"isEnabled": False}, _strengths=lambda: {})
     assert "mfa-not-required-for-all" not in got and "mfa-control-unread" in got, got
     reset()
+    # Attribute classes decide who writes a steering attribute.
+    assert M.attribute_class("user.extensionAttribute5") == "onprem"
+    assert M.attribute_class("user.onPremisesExtensionAttributes.extensionAttribute3") == "onprem"
+    assert M.attribute_class("user.customSecurityAttributes.Eng_Project") == "csa"
+    assert M.attribute_class("user.extension_00112233445566778899aabbccddeeff_team") == "schema"
+    assert M.attribute_class("user.department") == ""
+    assert M.schema_app_id("user.extension_00112233445566778899aabbccddeeff_team") == "00112233-4455-6677-8899-aabbccddeeff"
+    assert M.schema_app_id("user.extabcdefgh_team") == ""
+    # An application owner who writes a schema extension steers the group that reads it.
+    app_id = "00112233445566778899aabbccddeeff"
+    w_idx = M.Index([{"kind": "AZUser", "id": "u1", "properties": {"userPrincipalName": "a@example.com"}}], "ok")
+
+    def w_graph_all(path, limit=25, beta=False, max_pages=None):
+        if "roleAssignments" in path:
+            return [{"principalId": "g1", "roleDefinitionId": "/roleDefinitions/62e90394-69f5-4237-9190-012177145e10"}]
+        return []
+
+    def w_graph(path, beta=False):
+        if path.startswith("applications?$filter=appId"):
+            return {"value": [{"id": "o1", "displayName": "CRM Sync", "appId": app_id}]}
+        if "owners" in path:
+            return {"value": [{"userPrincipalName": "dev@example.com"}]}
+        return {"value": []}
+
+    got = _run("entra-attribute-writers", {"idx": w_idx, "dynamic": set(), "dyn_done": True},
+               dynamic_groups=lambda ctx: {"g1": ("Priv", 'user.extension_' + app_id + '_team -eq "red"', "On")},
+               graph_all=w_graph_all, graph=w_graph)
+    assert "schema-extension-steers-role-group" in got, got
+    assert [c["chain"] for c in M.CHAINS] == ["app-owner-to-dynamic-group"], M.CHAINS
+    reset()
     # A property the API did not return is unknown, never off.
     rows = [{"name": "v", "subscriptionId": subs[0], "soft": "Enabled", "enhanced": "", "immut": ""}]
     got = _run("sub-backup-rsv-posture", {"subs": subs}, arg_rows=lambda *a, **k: rows)

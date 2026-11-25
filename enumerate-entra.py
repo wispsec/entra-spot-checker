@@ -1216,6 +1216,12 @@ FRAMEWORK = {
     "backup-soft-delete-off": ("CWE-693", "GOV-"),
     "dynamic-group-steerable": ("CWE-269", "ID-"),
     "dynamic-group-holds-role": ("CWE-269", "ID-"),
+    "schema-extension-steers-role-group": ("CWE-269", "ID-"),
+    "schema-extension-writer-unknown": ("CWE-1059", "ID-"),
+    "csa-writer-steers-role-group": ("CWE-269", "ID-"),
+    "onprem-attribute-steers-role-group": ("CWE-269", "ID-"),
+    "user-admin-steers-role-group": ("CWE-269", "ID-"),
+    "attribute-writer-unassessed": ("CWE-1059", "ID-"),
     "ca-policy-report-only": ("CWE-693", "CA-"),
     "ca-exclusion-dynamic-group": ("CWE-693", "CA-"),
     "ca-policy-has-exclusions": ("CWE-693", "CA-"),
@@ -2881,6 +2887,34 @@ STEER_OPEN = ("guest", "device")
 STEER_LABEL = {"guest": "anyone who can invite a guest", "device": "anyone who can register a device",
                "privileged": "attribute writer (admin, on-prem sync or app with User.ReadWrite.All)"}
 MAILISH = ("user.mail", "user.othermails", "user.proxyaddresses", "user.userprincipalname")
+# Roles that write a dynamic-rule attribute outside a profile field.
+ATTRIBUTE_WRITERS = {
+    "58a13ea3-c632-46ae-9ee0-9c0d43cd7f3d": "Attribute Assignment Administrator",
+    "fe930be7-5e62-47db-91af-98c3a49a38b1": "User Administrator",
+    "729827e3-9c14-49f7-bb1b-9608f156bbb8": "Helpdesk Administrator",
+}
+SCHEMA_APP = re.compile(r"^user\.extension_([0-9a-f]{32})_")
+
+
+def attribute_class(attr):
+    """Writer class of one dynamic-rule attribute: csa, schema, onprem, or "" for a profile field."""
+    a = str(attr).lower()
+    if a.startswith("user.customsecurityattributes."):
+        return "csa"
+    if a.startswith("user.extension_"):
+        return "schema"
+    if a.startswith("user.extensionattribute") or a.startswith("user.onpremisesextensionattributes."):
+        return "onprem"
+    return ""
+
+
+def schema_app_id(attr):
+    """The application id a schema extension belongs to, or "" for an ext<guid> extension."""
+    found = SCHEMA_APP.match(str(attr).lower())
+    if not found:
+        return ""
+    raw = found.group(1)
+    return raw[:8] + "-" + raw[8:12] + "-" + raw[12:16] + "-" + raw[16:20] + "-" + raw[20:]
 DEVICE_SET = ("device.displayname", "device.devicemodel", "device.devicemanufacturer", "device.deviceostype",
               "device.deviceosversion", "device.accountenabled")
 RULE_TERM = re.compile(r'((?:user|device)\.[a-z0-9_.]+)\s+(?:-(?:any|all)\s*\(\s*_\s+)?(-[a-z]+)\s+("[^"]*"|\[[^\]]*\]|\S+)')
@@ -3067,11 +3101,112 @@ def c_dyn(ctx):
             sev = None
         if not sev:
             continue
+        shown = ",".join(a + ("(" + attribute_class(a) + ")" if attribute_class(a) else "") for a in attrs) or "-"
         add(sev, "dynamic-group-steerable", label,
-            "steer=" + steer + " attrs=" + (",".join(attrs) or "-") + " grants=" + (",".join(g for _r, g in grants[:3]) or ("not assessed" if gid in blind else "none")) + " rule=" + rule[:80],
+            "steer=" + steer + " attrs=" + shown + " grants=" + (",".join(g for _r, g in grants[:3]) or ("not assessed" if gid in blind else "none")) + " rule=" + rule[:80],
             "whoever can steer the rule decides who holds what the group grants")
         if sev in ("critical", "high"):
             chain("dynamic-group-to-capability", STEER_LABEL[steer] + " -> " + group_node(ctx, gid) + " -> " + grants[0][1], sev, "a rule an outsider can satisfy grants this access")
+
+
+@check("entra-attribute-writers")
+def c_attribute_writers(ctx):
+    """Who can write the attribute that decides a privileged group's membership.
+
+    A rule keyed on a schema extension is decided by whoever owns the application
+    that defines it. A rule keyed on a custom security attribute is decided by the
+    holders of Attribute Assignment Administrator. A rule keyed on an extension
+    attribute is decided by on-premises AD when the directory is synced, and by a
+    user administrator when it is not.
+    """
+    groups = dynamic_groups(ctx)
+    if groups is None:
+        note("entra-attribute-writers", 0, denied=1)
+        return
+    assignments = graph_all("roleManagement/directory/roleAssignments", limit=5)
+    if assignments is None:
+        note("entra-attribute-writers", 0, denied=1)
+        return
+    holders = Counter()
+    role_of = {}
+    for a in assignments:
+        rid = str(dig(a, "roleDefinitionId")).split("/")[-1]
+        role_of.setdefault(str(dig(a, "principalId")), rid)
+        label = ATTRIBUTE_WRITERS.get(rid)
+        if label:
+            holders[label] += 1
+    try:
+        synced = any(tri(dig(ctx["idx"].props(u), "onPremisesSyncEnabled")) is True for u in ctx["idx"].users())
+    except DatasetUnavailable:
+        synced = None
+    examined = 0
+    for gid, (name, rule, _state) in groups.items():
+        if gid not in role_of:
+            continue
+        steer, attrs = rule_steer(rule)
+        if steer == "fixed":
+            continue
+        examined += 1
+        label = name or gid
+        for attr in attrs:
+            kind = attribute_class(attr)
+            if not kind:
+                continue
+            if kind == "schema":
+                app_id = schema_app_id(attr)
+                if not app_id:
+                    add("info", "schema-extension-writer-unknown", label, "attr=" + attr + " appId=none",
+                        "an ext<guid> extension has no owning application; confirm who can write it")
+                    continue
+                app = graph("applications?$filter=appId eq '" + app_id + "'&$select=id,displayName,appId")
+                if app is None:
+                    if az_kind() != "absent":
+                        undecided("attribute-writer-unassessed", "attr=" + attr, "the application that owns this schema extension was not read")
+                    continue
+                first = lst(dig(app, "value"))[:1]
+                if not first:
+                    continue
+                app_name = str(val(dig(first[0], "displayName"), app_id))
+                owners = graph("applications(appId='" + app_id + "')/owners?$select=id,userPrincipalName")
+                if owners is None:
+                    if az_kind() != "absent":
+                        undecided("attribute-writer-unassessed", "attr=" + attr, "owners of the schema extension application were not read")
+                    continue
+                humans = [str(val(dig(o, "userPrincipalName"), "")) for o in lst(dig(owners, "value"))]
+                humans = [h for h in humans if h]
+                if humans:
+                    add("high", "schema-extension-steers-role-group", label,
+                        "attr=" + attr + " app=" + app_name + " owners=" + ",".join(humans[:3]),
+                        "an owner of the application writes the extension for any user, which changes membership")
+                    chain("app-owner-to-dynamic-group",
+                          "user " + humans[0] + " -> owns " + app_name + " -> writes " + attr + " -> " + label,
+                          "high", "an application owner sets the attribute this rule reads")
+                else:
+                    add("info", "schema-extension-writer-unknown", label,
+                        "attr=" + attr + " app=" + app_name + " owners=0",
+                        "no human owns the application; the writer is whoever holds its credentials")
+            elif kind == "csa":
+                count = holders["Attribute Assignment Administrator"]
+                if count:
+                    add("medium", "csa-writer-steers-role-group", label,
+                        "attr=" + attr + " attrAssignAdmins=" + str(count),
+                        "a holder of Attribute Assignment Administrator sets the value this rule reads")
+                else:
+                    add("info", "attribute-writer-unassessed", label,
+                        "attr=" + attr + " attrAssignAdmins=0",
+                        "no holder of Attribute Assignment Administrator was found; confirm the writer of this attribute set")
+            elif synced:
+                add("medium", "onprem-attribute-steers-role-group", label,
+                    "attr=" + attr + " onPremisesSyncEnabled=yes",
+                    "on-premises AD writes the value, so an AD compromise steers membership")
+            elif synced is None:
+                undecided("attribute-writer-unassessed", "attr=" + attr, "the sync state of the directory was not read")
+            else:
+                count = holders["User Administrator"]
+                add("medium" if count else "info", "user-admin-steers-role-group", label,
+                    "attr=" + attr + " userAdmins=" + str(count),
+                    "a user administrator writes this attribute; no on-premises writer is present")
+    note("entra-attribute-writers", examined)
 
 
 @check("entra-group-roles")
@@ -3550,6 +3685,8 @@ ROLE_TEMPLATE_IDS = {
     "b1be1c3e-b65d-4f19-8427-f6fa0d97feb9": "CAAdmin",
     "194ae4cb-b126-40b2-bd5b-6091b380977d": "SecAdmin",
     "29232cdf-9323-42fd-ade2-1d097af3e4de": "ExoAdmin",
+    "58a13ea3-c632-46ae-9ee0-9c0d43cd7f3d": "AttrAssignAdmin",
+    "8424c6f0-a189-499e-bbd0-26c1753c96d4": "AttrDefAdmin",
 }
 
 
@@ -6282,7 +6419,7 @@ def c_policy_depth(ctx):
         add("medium", "policy-effect-disabled", r.get("name"), "effect=Disabled", "definition never evaluates", r.get("subscriptionId"))
     audit = arg_rows("PolicyResources | where type =~ 'microsoft.authorization/policydefinitions' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | where tostring(properties.policyRule.then.effect) == 'Audit' | summarize n=count() by subscriptionId", ctx["subs"], scoped=False)
     for r in unread_list(audit, "audit-only policy definitions", "policy-audit-definitions-unreadable"):
-        add("info", "policy-audit-only", r.get("subscriptionId"), "definitions=" + str(r.get("n")), "audit-only definitions do not block", r.get("subscriptionId"))
+        add("info", "policy-audit-only", r.get("subscriptionId"), "definitions=" + str(r.get("n")), "audit-only definitions do not block", dig(r, "subscriptionId"))
 
 
 @check("sub-backup-items")
@@ -7041,7 +7178,7 @@ def c_routes(ctx):
         if hop in ("Internet", "None"):
             add("medium", "route-default-to-internet", r.get("name"), "route=" + str(r.get("route")) + " nextHop=" + hop, "all egress bypasses inspection", r.get("subscriptionId"))
         else:
-            add("info", "route-default-captured", r.get("name"), "route=" + str(r.get("route")) + " nextHop=" + hop, "default route is captured by an appliance", r.get("subscriptionId"))
+            add("info", "route-default-captured", r.get("name"), "route=" + str(r.get("route")) + " nextHop=" + hop, "default route is captured by an appliance", dig(r, "subscriptionId"))
 
 
 @check("sub-appservice-net")
