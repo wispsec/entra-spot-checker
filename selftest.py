@@ -3,6 +3,7 @@
 Run: python3 selftest.py
 Exit 0 when a total read failure produces no medium, high or critical finding.
 """
+import base64
 import importlib.util
 import io
 import os
@@ -590,6 +591,9 @@ def payloads():
     foreign = "22222222-2222-2222-2222-222222222222"
     ga = "62e90394-69f5-4237-9190-012177145e10"
     owner = "/providers/microsoft.authorization/roledefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+    thumb = lambda hex_text: base64.b64encode(bytes.fromhex(hex_text)).decode()
+    THUMB_AABB = thumb("aabbccdd")
+    THUMB_FFFF = thumb("ffffffff")
     keep_home = M.HOME_TENANT["id"]
     keep_beta = M.CA_BETA["state"]
     M.HOME_TENANT["id"] = home
@@ -823,6 +827,39 @@ def payloads():
                                        {"id": "sp1", "appId": "a1", "displayName": "SP",
                                         "servicePrincipalType": "Application"})},
          (), ("azure-privileged-sp-no-human-owner",), None),
+        ("two applications claiming one identifier is a collision", "entra-app-identifiers", {"subs": []},
+         {"graph_all": lambda p, *a, **k: ([{"id": "contoso.com", "isVerified": True}] if "domains" in p else
+                                           ([{"displayName": "A", "identifierUris": ["https://sp.contoso.com/a"]},
+                                             {"displayName": "B", "identifierUris": ["https://sp.contoso.com/a"]}]
+                                            if "applications" in p else []))},
+         ("app-identifier-duplicate",), (), None),
+        ("an identifier on an unverified domain is not proven", "entra-app-identifiers", {"subs": []},
+         {"graph_all": lambda p, *a, **k: ([{"id": "contoso.com", "isVerified": False}] if "domains" in p else
+                                           ([{"displayName": "A", "identifierUris": ["https://sp.contoso.com/a"]}]
+                                            if "applications" in p else []))},
+         ("app-identifier-unverified-domain",), (), None),
+        ("two principals claiming one name is a collision", "entra-app-identifiers", {"subs": []},
+         {"graph_all": lambda p, *a, **k: ([] if "domains" in p or "applications" in p else
+                                           [{"displayName": "A", "servicePrincipalNames": ["api://x"]},
+                                            {"displayName": "B", "servicePrincipalNames": ["api://x"]}])},
+         ("sp-name-collision",), (), None),
+        ("assignment required with nobody assigned is unusable", "entra-app-assignees", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"id": "sp1", "displayName": "A"}],
+          "graph": lambda *a, **k: {"value": []}},
+         ("enterprise-app-no-assignee",), (), None),
+        ("a hidden application is not visible to its users", "entra-app-visibility", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"id": "sp1", "displayName": "A", "tags": ["HideApp"]}]},
+         ("sp-hidden-from-users",), (), None),
+        ("a pinned signing key that matches a credential is not a finding", "entra-saml-config", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "A", "notificationEmailAddresses": ["a@x"],
+                                         "preferredTokenSigningKeyThumbprint": "aabbccdd",
+                                         "keyCredentials": [{"customKeyIdentifier": THUMB_AABB}]}]},
+         (), ("saml-pinned-key-missing",), None),
+        ("a pinned signing key that matches nothing is a finding", "entra-saml-config", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "A", "notificationEmailAddresses": ["a@x"],
+                                         "preferredTokenSigningKeyThumbprint": "aabbccdd",
+                                         "keyCredentials": [{"customKeyIdentifier": THUMB_FFFF}]}]},
+         ("saml-pinned-key-missing",), (), None),
     ]
     fails = []
     try:

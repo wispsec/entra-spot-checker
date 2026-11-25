@@ -6,7 +6,7 @@ breaking it.
 
 ## Repository facts
 
-- `enumerate-entra.py` is one 10,000-line Python file with 314 `@check` functions.
+- `enumerate-entra.py` is one 11,600-line Python file with 319 `@check` functions.
   Standard library only. No packaging step.
 - `selftest.py` carries two suites. `fail_all()` asserts that a total read
   failure produces no verdict. `payloads()` asserts that a documented payload

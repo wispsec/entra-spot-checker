@@ -10,6 +10,7 @@ Files written:
 import argparse
 import ast
 import atexit
+import base64
 import contextlib
 import inspect
 import ipaddress
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
+from urllib.parse import urlsplit
 
 SEV = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 # Node and edge colour per severity in the --dot rendering.
@@ -5462,6 +5464,111 @@ def c_enterprise_apps(ctx):
             add("low", "disabled-sp-with-credentials", dig(sp, "displayName"), "accountEnabled=false credentials=" + str(len(lst(dig(sp, "passwordCredentials"))) + len(lst(dig(sp, "keyCredentials")))), "the principal cannot sign in while disabled, but the credential material remains and works again if it is re-enabled")
 
 
+def uri_host(value):
+    """Lowercase host of an http(s) identifier, the domain after @, or the empty string."""
+    text = str(value).strip()
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return ""
+    if parts.scheme in ("http", "https") and parts.hostname:
+        return parts.hostname.lower()
+    if "@" in text and "://" not in text:
+        return text.rsplit("@", 1)[1].lower()
+    return ""
+
+
+def thumbprint_of(value):
+    """Hex SHA-1 from a keyCredential customKeyIdentifier, which the API returns in base64."""
+    raw = str(val(value, "")).strip()
+    if not raw:
+        return ""
+    try:
+        return base64.b64decode(raw).hex()
+    except (ValueError, TypeError):
+        return ""
+
+
+@check("entra-app-identifiers")
+def c_app_identifiers(ctx):
+    """Who else claims the same identifier URI or service principal name.
+
+    A duplicate identifier URI is a SAML entity-id collision: an assertion issued
+    for one application can be routed to the other. A duplicate service principal
+    name is a UPN collision on the sync path. An identifier on a domain the tenant
+    lists but has not verified trusts a name the tenant does not control.
+    """
+    domains = graph_all("domains?$select=id,isVerified", limit=3)
+    apps = graph_all("applications?$select=appId,displayName,identifierUris", limit=10)
+    sps = graph_all("servicePrincipals?$select=appId,displayName,servicePrincipalNames", limit=10)
+    if apps is None or sps is None:
+        note("entra-app-identifiers", 0, denied=1)
+        return
+    note("entra-app-identifiers", len(apps) + len(sps))
+    if domains is None:
+        undecided("app-identifier-domain-unread", "domains unreadable", "identifier URIs were not compared with the verified domains")
+    unverified = {str(dig(d, "id")).lower() for d in lst(domains) if tri(dig(d, "isVerified")) is not True}
+    owners = defaultdict(set)
+    for a in apps:
+        label = str(val(dig(a, "displayName"), dig(a, "appId")))
+        for uri in lst(dig(a, "identifierUris")):
+            key = str(uri).strip().lower()
+            if not key:
+                continue
+            owners[key].add(label)
+            host = uri_host(key)
+            if host and any(host == d or host.endswith("." + d) for d in unverified):
+                add("low", "app-identifier-unverified-domain", label, "identifierUri=" + key[:60] + " host=" + host, "the identifier names a domain this tenant has not verified, so the name is not proven")
+    for key, holders in sorted(owners.items()):
+        if len(holders) > 1:
+            add("medium", "app-identifier-duplicate", key[:60], "applications=" + ",".join(sorted(holders)[:3]), "two applications claim the same identifier, so a SAML assertion can be routed to the wrong one")
+    claimed = defaultdict(set)
+    for s in sps:
+        label = str(val(dig(s, "displayName"), dig(s, "appId")))
+        for name in lst(dig(s, "servicePrincipalNames")):
+            key = str(name).strip().lower()
+            if key:
+                claimed[key].add(label)
+    for key, holders in sorted(claimed.items()):
+        if len(holders) > 1:
+            add("medium", "sp-name-collision", key[:60], "principals=" + ",".join(sorted(holders)[:3]), "two service principals claim the same name, so an identity resolved by name can reach the wrong principal")
+    sample("entra-app-identifiers", min(len(apps), 10) + min(len(sps), 10), len(apps) + len(sps), "applications and service principals")
+
+
+@check("entra-app-assignees")
+def c_app_assignees(ctx):
+    """An application that requires assignment and has none is usable by nobody."""
+    sps = graph_all("servicePrincipals?$filter=appRoleAssignmentRequired eq true&$select=id,displayName", limit=10)
+    if sps is None:
+        note("entra-app-assignees", 0, denied=1)
+        return
+    note("entra-app-assignees", len(sps))
+    for sp in sps[:15]:
+        label = str(val(dig(sp, "displayName"), dig(sp, "id")))
+        doc = graph("servicePrincipals/" + str(dig(sp, "id")) + "/appRoleAssignedTo")
+        if doc is None:
+            denied_now("entra-app-assignees")
+            add("info", "enterprise-app-assignees-unread", label, "appRoleAssignedTo unreadable", "whether any principal is assigned was not decided")
+            continue
+        if not lst(dig(doc, "value")):
+            add("low", "enterprise-app-no-assignee", label, "appRoleAssignmentRequired=true assignments=0", "no principal is assigned, so the application is unusable for every user")
+    sample("entra-app-assignees", min(len(sps), 15), len(sps), "applications that require assignment")
+
+
+@check("entra-app-visibility")
+def c_app_visibility(ctx):
+    """An application hidden from users cannot be found, consented to or revoked by them."""
+    sps = graph_all("servicePrincipals?$select=id,displayName,tags", limit=10)
+    if sps is None:
+        note("entra-app-visibility", 0, denied=1)
+        return
+    note("entra-app-visibility", len(sps))
+    for sp in sps:
+        tags = [str(t) for t in lst(dig(sp, "tags"))]
+        if "HideApp" in tags:
+            add("low", "sp-hidden-from-users", str(val(dig(sp, "displayName"), dig(sp, "id"))), "tags=HideApp", "the application is hidden from users, so its consent and assignment are not visible to them")
+
+
 @check("entra-dormant")
 def c_dormant(ctx):
     users = graph_all("users?$select=userPrincipalName,accountEnabled,signInActivity", limit=10)
@@ -7296,20 +7403,30 @@ def c_publisher(ctx):
 
 @check("entra-saml-config")
 def c_saml_config(ctx):
-    sps = graph_all("servicePrincipals?$filter=preferredSingleSignOnMode eq 'saml'&$select=id,displayName,preferredSingleSignOnMode,samlSingleSignOnSettings,notificationEmailAddresses,preferredTokenSigningKeyThumbprint", limit=10)
+    sps = graph_all("servicePrincipals?$filter=preferredSingleSignOnMode eq 'saml'&$select=id,displayName,preferredSingleSignOnMode,samlSingleSignOnSettings,notificationEmailAddresses,preferredTokenSigningKeyThumbprint,keyCredentials", limit=10)
     if sps is None:
         note("entra-saml-config", 0, denied=1)
         return
     note("entra-saml-config", len(sps))
     for sp in sps:
-        st = sp.get("samlSingleSignOnSettings") or {}
-        relay = str(st.get("relayState") or "")
+        label = str(val(dig(sp, "displayName"), dig(sp, "id")))
+        relay = str(val(dig(sp, "samlSingleSignOnSettings.relayState"), ""))
         if relay.lower().startswith("http://"):
-            add("high", "saml-relay-state-plaintext", sp.get("displayName"), "relayState=" + relay[:60], "assertion posted over plaintext HTTP")
-        if not (sp.get("notificationEmailAddresses") or []):
-            add("low", "saml-no-cert-contacts", sp.get("displayName"), "notificationEmailAddresses empty", "certificate expiry warnings have no recipient")
-        if not sp.get("preferredTokenSigningKeyThumbprint"):
-            add("medium", "saml-no-pinned-key", sp.get("displayName"), "preferredTokenSigningKeyThumbprint unset", "either signing certificate is accepted; rotation can be hijacked")
+            add("high", "saml-relay-state-plaintext", label, "relayState=" + relay[:60], "assertion posted over plaintext HTTP")
+        if not lst(dig(sp, "notificationEmailAddresses")):
+            add("low", "saml-no-cert-contacts", label, "notificationEmailAddresses empty", "certificate expiry warnings have no recipient")
+        thumb = str(val(dig(sp, "preferredTokenSigningKeyThumbprint"), "")).replace(" ", "").lower()
+        if not thumb:
+            add("medium", "saml-no-pinned-key", label, "preferredTokenSigningKeyThumbprint unset", "either signing certificate is accepted; rotation can be hijacked")
+        else:
+            keys = lst(dig(sp, "keyCredentials"))
+            if not keys:
+                add("info", "saml-pinned-key-unchecked", label, "preferredTokenSigningKeyThumbprint set keyCredentials=0", "the pinned signing key was not returned, so the pin could not be verified")
+            else:
+                known = {thumbprint_of(dig(k, "customKeyIdentifier")) for k in keys}
+                known |= {str(val(dig(k, "keyId"), "")).lower() for k in keys}
+                if thumb not in known:
+                    add("medium", "saml-pinned-key-missing", label, "preferredTokenSigningKeyThumbprint=" + thumb[:12] + " keyCredentials=" + str(len(keys)), "the pinned signing key is not among the credentials on the principal; tokens are signed with a key the pin does not name")
 
 
 @check("entra-admin-unit-scope")

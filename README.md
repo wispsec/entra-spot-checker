@@ -10,7 +10,7 @@ beside it and exercises the failure paths and the documented payload shapes.
 
 ## What it does
 
-- Runs 315 checks against Azure Resource Graph, the ARM REST API and Microsoft
+- Runs 319 checks against Azure Resource Graph, the ARM REST API and Microsoft
   Graph.
 - Reads an AzureHound export for identity objects that Graph access does not
   reach.

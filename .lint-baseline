@@ -1,4 +1,4 @@
-total 1298
+total 1290
 check entra-admin-unit-scope 5
 check entra-agent-identities 1
 check entra-api-scopes 7
@@ -71,7 +71,6 @@ check entra-redirect-uri 5
 check entra-risky-signins 7
 check entra-role-assignable-groups 3
 check entra-saml-certs 11
-check entra-saml-config 8
 check entra-scim-jobs 7
 check entra-security-defaults 3
 check entra-sp-roles 5
