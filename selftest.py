@@ -591,6 +591,14 @@ def payloads():
     foreign = "22222222-2222-2222-2222-222222222222"
     ga = "62e90394-69f5-4237-9190-012177145e10"
     owner = "/providers/microsoft.authorization/roledefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+    HEX40 = "aa" * 20
+    QUERIES = []
+
+    def RECORD(tag, value):
+        def call(query, *a, **k):
+            QUERIES.append(query)
+            return value
+        return call
     thumb = lambda hex_text: base64.b64encode(bytes.fromhex(hex_text)).decode()
     THUMB_AABB = thumb("aabbccdd")
     THUMB_FFFF = thumb("ffffffff")
@@ -829,19 +837,19 @@ def payloads():
          (), ("azure-privileged-sp-no-human-owner",), None),
         ("two applications claiming one identifier is a collision", "entra-app-identifiers", {"subs": []},
          {"graph_all": lambda p, *a, **k: ([{"id": "contoso.com", "isVerified": True}] if "domains" in p else
-                                           ([{"displayName": "A", "identifierUris": ["https://sp.contoso.com/a"]},
-                                             {"displayName": "B", "identifierUris": ["https://sp.contoso.com/a"]}]
+                                           ([{"appId": "a1", "displayName": "A", "identifierUris": ["https://sp.contoso.com/a"]},
+                                             {"appId": "a2", "displayName": "B", "identifierUris": ["https://sp.contoso.com/a"]}]
                                             if "applications" in p else []))},
          ("app-identifier-duplicate",), (), None),
         ("an identifier on an unverified domain is not proven", "entra-app-identifiers", {"subs": []},
          {"graph_all": lambda p, *a, **k: ([{"id": "contoso.com", "isVerified": False}] if "domains" in p else
-                                           ([{"displayName": "A", "identifierUris": ["https://sp.contoso.com/a"]}]
+                                           ([{"appId": "a1", "displayName": "A", "identifierUris": ["https://sp.contoso.com/a"]}]
                                             if "applications" in p else []))},
          ("app-identifier-unverified-domain",), (), None),
         ("two principals claiming one name is a collision", "entra-app-identifiers", {"subs": []},
          {"graph_all": lambda p, *a, **k: ([] if "domains" in p or "applications" in p else
-                                           [{"displayName": "A", "servicePrincipalNames": ["api://x"]},
-                                            {"displayName": "B", "servicePrincipalNames": ["api://x"]}])},
+                                           [{"id": "sp1", "displayName": "A", "servicePrincipalNames": ["api://x"]},
+                                            {"id": "sp2", "displayName": "B", "servicePrincipalNames": ["api://x"]}])},
          ("sp-name-collision",), (), None),
         ("assignment required with nobody assigned is unusable", "entra-app-assignees", {"subs": []},
          {"graph_all": lambda *a, **k: [{"id": "sp1", "displayName": "A"}],
@@ -860,6 +868,76 @@ def payloads():
                                          "preferredTokenSigningKeyThumbprint": "aabbccdd",
                                          "keyCredentials": [{"customKeyIdentifier": THUMB_FFFF}]}]},
          ("saml-pinned-key-missing",), (), None),
+        ("a missing private endpoint array reads as zero", "sub-private-endpoints", {"subs": ["s1"]},
+         {"arg_rows": RECORD("queries", [{"name": "kv", "type": "microsoft.keyvault/vaults",
+                                          "subscriptionId": "s1", "pe": 0, "publicNet": "Enabled"}])},
+         ("paas-no-private-endpoint",), (), lambda: any("coalesce(properties.privateEndpointConnections" in q for q in QUERIES)),
+        ("the Key Vault private endpoint count keeps its unknown state", "sub-kv-pe-state", {"subs": ["s1"]},
+         {"_kv_rows": lambda s: [{"name": "kv", "pe": None}],
+          "arg_rows": lambda *a, **k: []},
+         ("keyvault-private-endpoint-inventory",), (), lambda: "withPrivateEndpoint=0" in [f for f in evidence("keyvault-private-endpoint-inventory")][0]["evidence"]),
+        ("the approval rule nests its flag under setting", "entra-pim-policy", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "P", "rules": [
+             {"@odata.type": "#microsoft.graph.unifiedRoleManagementPolicyApprovalRule",
+              "setting": {"isApprovalRequired": True},
+              "enabledRules": ["MultiFactorAuthentication", "Justification"]}]}]},
+         ("pim-policy",), (), lambda: "approval=True" in evidence("pim-policy")[0]["evidence"]),
+        ("the connector is expanded, not guessed", "entra-b2x-userflows", {"subs": []},
+         {"graph_all": RECORD("b2x", [{"displayName": "F", "apiConnectorConfiguration": {
+             "postFederationSignup": {"id": "c1", "displayName": "Connector"}}}])},
+         ("b2x-api-connector",), (), lambda: any("$expand=apiConnectorConfiguration" in q for q in QUERIES)),
+        ("an unknown domain verification is not an unverified domain", "entra-app-identifiers", {"subs": []},
+         {"graph_all": lambda p, *a, **k: ([{"id": "contoso.com"}] if "domains" in p else
+                                           ([{"appId": "a1", "displayName": "A",
+                                              "identifierUris": ["https://sp.contoso.com/a"]}]
+                                            if "applications" in p else []))},
+         ("app-identifier-domain-unknown",), ("app-identifier-unverified-domain",), None),
+        ("two apps that share a name are still two holders", "entra-app-identifiers", {"subs": []},
+         {"graph_all": lambda p, *a, **k: ([] if "domains" in p else
+                                           ([{"appId": "a1", "displayName": "Same", "identifierUris": ["https://x/y"]},
+                                             {"appId": "a2", "displayName": "Same", "identifierUris": ["https://x/y"]}]
+                                            if "applications" in p else []))},
+         ("app-identifier-duplicate",), (), None),
+        ("a full read is not a sample", "entra-app-identifiers", {"subs": []},
+         {"graph_all": lambda p, *a, **k: ([] if "domains" in p else
+                                           ([{"appId": "a1", "displayName": "A", "identifierUris": []}]
+                                            if "applications" in p else
+                                            [{"id": "sp1", "displayName": "S", "servicePrincipalNames": []}]))},
+         (), (), lambda: M.COVERAGE["entra-app-identifiers"]["status"] != "sampled"),
+        ("a method enabled for sign-in but not for reset is not a reset method", "entra-sspr", {"subs": []},
+         {"graph": lambda p, *a, **k: ({"authenticationMethodConfigurations": [
+             {"id": "Sms", "state": "enabled", "selfServicePasswordResetEnabled": False}]}
+             if "authenticationMethodsPolicy" in p
+             else {"defaultUserRolePermissions": {"allowedToUseSSPR": False}})},
+         ("sspr-no-method",), ("sspr-single-method",), None),
+        ("a hex-formatted key identifier is not decoded as base64", "entra-saml-config", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "A", "notificationEmailAddresses": ["a@x"],
+                                         "preferredTokenSigningKeyThumbprint": HEX40,
+                                         "keyCredentials": [{"customKeyIdentifier": HEX40}]}]},
+         (), ("saml-pinned-key-missing",), None),
+        ("a disabled suppression rule hides nothing", "sub-defender-depth", {"subs": ["s1"]},
+         {"per_sub": lambda subs, path, api, pick: ({"s1": []} if "securityContacts" in path or "autoProvisioningSettings" in path
+                                                    else {"s1": [{"name": "r", "properties": {"state": "Disabled"}}]})},
+         ("defender-suppression-rule-disabled",), ("defender-suppression-rule",), None),
+        ("an unreturned authentication mode is not a SQL-login finding", "sub-sql-advanced", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "srv", "subscriptionId": "s1", "rg": "rg", "minTls": "1.2", "publicNet": "Disabled"}],
+          "az": lambda *a, **k: {"properties": {}} if "azureADOnlyAuthentications" in str(a) else None},
+         ("sql-aad-only-auth-unknown",), ("sql-aad-only-auth-off",), None),
+        ("an unread strength list does not hide the OR operator", "entra-ca",
+         {"subs": [], "idx": idx, "dynamic": set(), "dyn": {}},
+         {"ca_all": lambda *a, **k: [{"state": "enabled", "displayName": "P",
+                                      "conditions": {"users": {"includeUsers": ["All"]},
+                                                     "applications": {"includeApplications": ["All"]}},
+                                      "grantControls": {"operator": "OR",
+                                                        "builtInControls": ["mfa", "compliantDevice"],
+                                                        "authenticationStrength": {"id": "s1"}}}],
+          "_strengths": lambda: None},
+         ("ca-grant-operator-or",), (), None),
+        ("a /8 firewall range is wide", "sub-sql-firewall", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "srv", "subscriptionId": "s1", "rg": "rg"}],
+          "az": lambda *a, **k: {"value": [{"name": "r", "properties": {
+              "startIpAddress": "10.0.0.0", "endIpAddress": "10.255.255.255"}}]}},
+         ("sql-firewall-range-wide",), ("sql-firewall-rule",), None),
     ]
     fails = []
     try:

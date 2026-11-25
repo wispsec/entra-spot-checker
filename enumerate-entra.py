@@ -1574,7 +1574,7 @@ def node_view(raw):
             payload = found
             break
     if payload is None:
-        payload = raw if raw.get("id") and not kind else {}
+        payload = {key: value for key, value in raw.items() if key != "kind"}
     view = dict(payload)
     view["properties"] = payload
     if kind:
@@ -2061,7 +2061,6 @@ KV_FIELDS = {
     "rbac": ("properties.enableRbacAuthorization", tri),
     "policies": ("properties.accessPolicies", lambda v: v if isinstance(v, list) else []),
     "sku": ("properties.sku.name", lambda v: str(v).lower() if v is not MISSING and v is not None else None),
-    "pe": ("properties.privateEndpointConnections", lambda v: len(v) if isinstance(v, list) else 0),
 }
 
 KV_RULES = (
@@ -2305,7 +2304,7 @@ def c_sql_fw(ctx):
                 add("medium", "sql-allow-azure-services", str(dig(r, "name")) + " " + str(dig(rule, "name")), start + "-" + end, "Azure-internal range allowed; sentinel, not internet-wide", r.get("subscriptionId"))
             elif span_covers_all(start, end):
                 add("high", "sql-firewall-wide-open", str(dig(r, "name")) + " " + str(dig(rule, "name")), start + "-" + end, "the whole address space is admitted", r.get("subscriptionId"))
-            elif span is not None and span[1] - span[0] > 16777215:
+            elif span is not None and span[1] - span[0] >= 16777215:
                 add("medium", "sql-firewall-range-wide", str(dig(r, "name")) + " " + str(dig(rule, "name")), start + "-" + end, "the range holds more than 16 million addresses", dig(r, "subscriptionId"))
             else:
                 add("low", "sql-firewall-rule", str(dig(r, "name")) + " " + str(dig(rule, "name")), start + "-" + end, "verify the client still exists", r.get("subscriptionId"))
@@ -2420,12 +2419,12 @@ def _policy_maps_inner(subs):
     )
     if assigns is None and defs is None:
         mark_failure()
-        return {}, {}
+        return {}, {}, False
     assigns = unread_list(assigns, "policy assignments", "policy-assignments-unreadable")
     defs = unread_list(defs, "policy definitions", "policy-definitions-unreadable")
     amap = {str(a.get("id")).lower(): a for a in assigns}
     dmap = {str(d.get("id")).lower(): d for d in defs}
-    return amap, dmap
+    return amap, dmap, defs is not None
 
 
 @check("sub-policy")
@@ -2442,15 +2441,17 @@ def c_policy(ctx):
     if rows is None:
         note("sub-policy", 0, denied=1)
         return
-    amap, dmap = _policy_maps(subs)
+    amap, dmap, definitions_read = _policy_maps(subs)
     note("sub-policy", len(rows))
+    if not definitions_read:
+        undecided("policy-definition-unread", "policy definitions unreadable", "an exemption could not be graded by the policy it disables")
     for r in rows:
         aid = str(r.get("assignment") or "").lower()
         a = amap.get(aid) or {}
         d = dmap.get(str(a.get("def") or "").lower()) or {}
         target = d.get("displayName") or d.get("name") or a.get("name") or "unknown-definition"
         effect = str(d.get("effect") or "")
-        security = any(h in str(target).lower() for h in SECURITY_DEFINITION_HINTS)
+        security = any(h in str(target).lower() for h in SECURITY_DEFINITION_HINTS) if definitions_read else False
         expired = False
         unknown_expiry = False
         exp = r.get("exp")
@@ -2515,7 +2516,11 @@ def c_deployments(ctx):
                     stack.extend(cur.values())
                 elif isinstance(cur, list):
                     stack.extend(cur)
-                elif isinstance(cur, str) and len(cur) > 12 and not cur.startswith(("http", "/subscriptions")):
+                elif isinstance(cur, str) and len(cur) > 12:
+                    if cur.startswith(("http", "/subscriptions")):
+                        if SECRET_MATERIAL.search(cur):
+                            vals.append(cur)
+                        continue
                     vals.append(cur)
         hits = [v for v in vals if (SECRET_MATERIAL.search(v) or (SECRET_PAT.search(v) and not SECRET_NOISE.search(v))) and not v.lower().startswith("[parameters(")]
         if hits:
@@ -2668,7 +2673,7 @@ def c_mi(ctx):
                 kind = str(val(dig(doc, "servicePrincipalType"), ""))
                 kinds[pid] = kind
         if not kind:
-            add("high", "service-principal-privileged-role", name, "servicePrincipalType=unknown role=" + str(dig(r, "roleId")) + " scope=" + str(dig(r, "scope")), "an application identity holds a privileged role; its type could not be resolved", sub, str(dig(r, "scope")))
+            add("high", "service-principal-privileged-role", name, "servicePrincipalType=unknown role=" + str(dig(r, "roleId")) + " scope=" + str(dig(r, "scope")), "a workload identity holds a privileged role; whether it is an application or a managed identity was not resolved", sub, str(dig(r, "scope")))
             continue
         if kind != "ManagedIdentity":
             add("high", "service-principal-privileged-role", name, "servicePrincipalType=" + kind + " role=" + str(dig(r, "roleId")) + " scope=" + str(dig(r, "scope")), "an application identity can grant access or own resources", sub, str(dig(r, "scope")))
@@ -3608,15 +3613,15 @@ def c_ca(ctx):
             has_frequency = True
         if enforced and (cond.get("signInRiskLevels") or cond.get("userRiskLevels")):
             has_risk = True
+        if gc.get("operator") == "OR" and len(builtins) > 1:
+            add("medium", "ca-grant-operator-or", name, "operator=OR controls=" + ",".join(builtins), "any single control satisfies the policy")
         sid = (gc.get("authenticationStrength") or {}).get("id")
-        if sid:
-            if strengths is None:
-                continue
+        if sid and strengths is None:
+            undecided("ca-strength-unread", "policy=" + str(name), "the custom strength of this policy was not assessed")
+        elif sid:
             disp, combos = strengths.get(sid, (str(sid), []))
             single = [c for c in combos if "SingleFactor" in c]
             add("medium" if single else "info", "ca-auth-strength", name, "strength=" + str(disp) + " combos=" + ",".join(combos)[:60], "custom authentication strength; verify the combinations")
-        if gc.get("operator") == "OR" and len(builtins) > 1:
-            add("medium", "ca-grant-operator-or", name, "operator=OR controls=" + ",".join(builtins), "any single control satisfies the policy")
     if pols and not ca_complete():
         capped(CURRENT["check"], len(pols), "conditional access policy pages")
     if ca_complete() and not restricts_flows:
@@ -5121,7 +5126,7 @@ def c_private(ctx):
     q = """Resources
 | where subscriptionId in (""" + subq(ctx["subs"]) + """)
 | where type in~ ('microsoft.keyvault/vaults','microsoft.storage/storageaccounts','microsoft.sql/servers','microsoft.documentdb/databaseaccounts','microsoft.servicebus/namespaces','microsoft.eventhub/namespaces','microsoft.cognitiveservices/accounts')
-| project name, type, subscriptionId, pe=array_length(properties.privateEndpointConnections), publicNet=tostring(properties.publicNetworkAccess)"""
+| project name, type, subscriptionId, pe=array_length(coalesce(properties.privateEndpointConnections, dynamic([]))), publicNet=tostring(properties.publicNetworkAccess)"""
     rows = arg_rows(q, ctx["subs"], scoped=False)
     if rows is None:
         note("sub-private-endpoints", 0, denied=1)
@@ -5483,8 +5488,10 @@ def thumbprint_of(value):
     raw = str(val(value, "")).strip()
     if not raw:
         return ""
+    if re.fullmatch(r"[0-9a-fA-F]{40}", raw):
+        return raw.lower()
     try:
-        return base64.b64decode(raw).hex()
+        return base64.b64decode(raw, validate=True).hex()
     except (ValueError, TypeError):
         return ""
 
@@ -5507,32 +5514,38 @@ def c_app_identifiers(ctx):
     note("entra-app-identifiers", len(apps) + len(sps))
     if domains is None:
         undecided("app-identifier-domain-unread", "domains unreadable", "identifier URIs were not compared with the verified domains")
-    unverified = {str(dig(d, "id")).lower() for d in lst(domains) if tri(dig(d, "isVerified")) is not True}
+    unverified = {str(dig(d, "id")).lower() for d in lst(domains) if tri(dig(d, "isVerified")) is False}
+    unknown_domains = [d for d in lst(domains) if tri(dig(d, "isVerified")) is None]
+    if unknown_domains:
+        undecided("app-identifier-domain-unknown", str(len(unknown_domains)) + " domains without isVerified", "identifier URIs were not compared with those domains")
     owners = defaultdict(set)
-    for a in apps:
-        label = str(val(dig(a, "displayName"), dig(a, "appId")))
+    labels = {}
+    for index, a in enumerate(apps):
+        ident = str(val(dig(a, "appId"), dig(a, "id"))) or "#" + str(index)
+        label = str(val(dig(a, "displayName"), ident))
+        labels[ident] = label
         for uri in lst(dig(a, "identifierUris")):
             key = str(uri).strip().lower()
             if not key:
                 continue
-            owners[key].add(label)
+            owners[key].add(ident)
             host = uri_host(key)
             if host and any(host == d or host.endswith("." + d) for d in unverified):
                 add("low", "app-identifier-unverified-domain", label, "identifierUri=" + key[:60] + " host=" + host, "the identifier names a domain this tenant has not verified, so the name is not proven")
     for key, holders in sorted(owners.items()):
         if len(holders) > 1:
-            add("medium", "app-identifier-duplicate", key[:60], "applications=" + ",".join(sorted(holders)[:3]), "two applications claim the same identifier, so a SAML assertion can be routed to the wrong one")
+            add("medium", "app-identifier-duplicate", key[:60], "applications=" + ",".join(sorted(labels.get(h, h) for h in holders)[:3]), "two applications claim the same identifier, so a SAML assertion can be routed to the wrong one")
     claimed = defaultdict(set)
-    for s in sps:
-        label = str(val(dig(s, "displayName"), dig(s, "appId")))
+    for index, s in enumerate(sps):
+        ident = str(val(dig(s, "id"), dig(s, "appId"))) or "#" + str(index)
+        labels[ident] = str(val(dig(s, "displayName"), ident))
         for name in lst(dig(s, "servicePrincipalNames")):
             key = str(name).strip().lower()
             if key:
-                claimed[key].add(label)
+                claimed[key].add(ident)
     for key, holders in sorted(claimed.items()):
         if len(holders) > 1:
-            add("medium", "sp-name-collision", key[:60], "principals=" + ",".join(sorted(holders)[:3]), "two service principals claim the same name, so an identity resolved by name can reach the wrong principal")
-    sample("entra-app-identifiers", min(len(apps), 10) + min(len(sps), 10), len(apps) + len(sps), "applications and service principals")
+            add("medium", "sp-name-collision", key[:60], "principals=" + ",".join(sorted(labels.get(h, h) for h in holders)[:3]), "two service principals claim the same name, so an identity resolved by name can reach the wrong principal")
 
 
 @check("entra-app-assignees")
@@ -5700,7 +5713,7 @@ def c_pim_policy(ctx):
         if not rules:
             without_rules += 1
             continue
-        approval = any(tri(dig(rule, "settings.isApprovalRequired")) is True for rule in rules if "approval" in str(dig(rule, "@odata.type")).lower())
+        approval = any(tri(dig(rule, "setting.isApprovalRequired", dig(rule, "settings.isApprovalRequired"))) is True for rule in rules if "approval" in str(dig(rule, "@odata.type")).lower())
         mfa = any("MultiFactorAuthentication" in [str(x) for x in lst(dig(rule, "enabledRules"))] for rule in rules)
         justification = any("Justification" in [str(x) for x in lst(dig(rule, "enabledRules"))] for rule in rules)
         add("info", "pim-policy", dig(p, "displayName"), "rules=" + str(len(rules)) + " approval=" + str(approval) + " mfaOnActivation=" + str(mfa) + " justification=" + str(justification), "activation requirements for privileged roles")
@@ -6120,8 +6133,13 @@ def c_sql_advanced(ctx):
             add("info", "sql-failover-groups", r.get("name"), "count=" + str(n), "regional resilience inventory", r.get("subscriptionId"))
         aad = az(["rest", "--url", base + "/azureADOnlyAuthentications/default?api-version=2022-05-01-preview"])
         if aad is not None:
-            st = tri((aad.get("properties") or {}).get("azureADOnlyAuthentication"))
-            add("info" if st is True else "medium", "sql-aad-only-auth", r.get("name"), "azureADOnlyAuthentication=" + str(st), "Entra-only authentication" if st is True else "SQL logins remain enabled or unset")
+            st = tri(dig(aad, "properties.azureADOnlyAuthentication"))
+            if st is True:
+                add("info", "sql-aad-only-auth", dig(r, "name"), "azureADOnlyAuthentication=true", "Entra-only authentication", dig(r, "subscriptionId"))
+            elif st is False:
+                add("medium", "sql-aad-only-auth-off", dig(r, "name"), "azureADOnlyAuthentication=false", "SQL logins remain enabled alongside Entra", dig(r, "subscriptionId"))
+            else:
+                add("low", "sql-aad-only-auth-unknown", dig(r, "name"), "azureADOnlyAuthentication not returned", "the authentication mode cannot be confirmed", dig(r, "subscriptionId"))
     sample("sub-sql-advanced", min(len(rows), 20), len(rows), "SQL servers")
 
 
@@ -6548,7 +6566,7 @@ def c_locks_detail(ctx):
     note("sub-locks-detail", len(rows))
     lv = Counter(str(r.get("level")) for r in rows)
     for k, v in lv.items():
-        add("info", "lock-level", k, "count=" + str(v), "ReadOnly prevents change; CanNotDelete only prevents deletion")
+        add("info", "lock-level", k, "count=" + str(v), "ReadOnly prevents change; CanNotDelete only prevents deletion", "tenant")
     if not rows:
         add("low", "locks-absent-detail", "all", "0 locks", "nothing protects critical resources", "tenant")
 
@@ -6742,7 +6760,14 @@ def c_defender_depth(ctx):
     note("sub-defender-depth", sum(1 for v in sup.values() if v is not None), denied=sum(1 for v in sup.values() if v is None))
     for s, items in sup.items():
         for a in items or []:
-            add("medium", "defender-suppression-rule", s + " " + str(a.get("name")), "state=" + str((a.get("properties") or {}).get("state")), "alerts matching this rule are hidden", s)
+            name = s + " " + str(dig(a, "name"))
+            state = tri(dig(a, "properties.state"))
+            if state is True:
+                add("medium", "defender-suppression-rule", name, "state=Enabled", "alerts matching this rule are hidden", s)
+            elif state is False:
+                add("info", "defender-suppression-rule-disabled", name, "state=Disabled", "the rule exists but hides nothing", s)
+            else:
+                add("low", "defender-suppression-rule-unknown", name, "state not returned", "whether this suppression rule hides alerts cannot be confirmed", s)
 
 
 @check("sub-sentinel-depth")
@@ -6760,7 +6785,7 @@ def c_sentinel_depth(ctx):
         kinds[kind] += count
         per[str(val(dig(r, "subscriptionId"), ""))][kind] += count
     for k, v in kinds.items():
-        add("info", "sentinel-content", k, "count=" + str(v), "detection content inventory")
+        add("info", "sentinel-content", k, "count=" + str(v), "detection content inventory", "tenant")
     for s in ctx["subs"]:
         counts = per.get(s, Counter())
         if not counts:
@@ -7481,7 +7506,7 @@ def c_mgmt_hierarchy(ctx):
     note("sub-mgmt-hierarchy", len(rows))
     roots = [r for r in rows if not r.get("parent")]
     for r in roots:
-        add("info", "management-group-root", r.get("name"), "children=" + str(len(r.get("children") or [])), "hierarchy root; Owner here covers every subscription below")
+        add("info", "management-group-root", dig(r, "name"), "children=" + str(len(lst(dig(r, "children")))), "hierarchy root; Owner here covers every subscription below", "tenant")
     arr = unread(arg_rows(tenant_wide("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where tostring(properties.scope) == '/' | project principalId=tostring(properties.principalId), roleId=tostring(properties.roleDefinitionId), principalType=tostring(properties.principalType)"), ctx["subs"], scoped=False),
                  "tenant root role assignments", "tenant-root-assignments-unreadable")
     if arr is None:
@@ -7489,7 +7514,7 @@ def c_mgmt_hierarchy(ctx):
     for r in arr:
         rid = str(r.get("roleId") or "")
         if rid.endswith(BUILTIN_ROLE_OWNER) or rid.endswith(BUILTIN_ROLE_UAA):
-            add("critical", "tenant-root-role-assignment", str(r.get("principalId")), "role=" + rid + " type=" + str(r.get("principalType")), "assignment at tenant root covers every subscription and management group")
+            add("critical", "tenant-root-role-assignment", str(dig(r, "principalId")), "role=" + rid + " type=" + str(dig(r, "principalType")), "assignment at tenant root covers every subscription and management group", "tenant")
 
 
 @check("sub-diag-content")
@@ -7745,7 +7770,7 @@ def c_redirect(ctx):
 
 @check("sub-policy-notscopes")
 def c_policy_notscopes(ctx):
-    rows = arg_rows("PolicyResources | where type =~ 'microsoft.authorization/policyassignments' | where array_length(properties.notScopes) > 0 | extend ns=properties.notScopes | mv-expand n=ns | project name, subscriptionId, excluded=tostring(n)", ctx["subs"])
+    rows = arg_rows("PolicyResources | where type =~ 'microsoft.authorization/policyassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | where array_length(properties.notScopes) > 0 | extend ns=properties.notScopes | mv-expand n=ns | project name, subscriptionId, excluded=tostring(n)", ctx["subs"], scoped=False)
     if rows is None:
         note("sub-policy-notscopes", 0, denied=1)
         return
@@ -7930,7 +7955,7 @@ def c_pim_azure(ctx):
         add("info", "azure-pim-eligibility-unreadable", "all", "0 eligibility schedules visible", "either no PIM use or the caller cannot read schedules")
         return
     for r in rows:
-        add("info", "azure-pim-eligible", str(r.get("principalId")), "role=" + str(r.get("roleId")) + " scope=" + str(r.get("scope")), "eligible assignment; activation rules are not readable through ARG")
+        add("info", "azure-pim-eligible", str(dig(r, "principalId")), "role=" + str(dig(r, "roleId")) + " scope=" + str(dig(r, "scope")), "eligible assignment; activation rules are not readable through ARG", ctx_sub(r))
 
 
 @check("entra-pim-groups")
@@ -8520,7 +8545,7 @@ def c_external_id_policy(ctx):
 
 @check("entra-b2x-userflows")
 def c_b2x(ctx):
-    rows = graph_all("identity/b2xUserFlows", limit=5, beta=True)
+    rows = graph_all("identity/b2xUserFlows?$expand=apiConnectorConfiguration", limit=5, beta=True)
     if rows is None:
         note("entra-b2x-userflows", 0, denied=1)
         return
@@ -9348,8 +9373,12 @@ def c_sspr(ctx):
         note("entra-sspr", 1, denied=1)
         add("info", "sspr-unassessed", "tenant", "authenticationMethodsPolicy unreadable", "reset methods were not assessed")
         return
-    methods = [str(dig(c, "id")) for c in lst(dig(pol, "authenticationMethodConfigurations"))
-               if str(dig(c, "state")).lower() == "enabled" or tri(dig(c, "selfServicePasswordResetEnabled")) is True]
+    methods = []
+    for c in lst(dig(pol, "authenticationMethodConfigurations")):
+        reset_flag = tri(dig(c, "selfServicePasswordResetEnabled"))
+        eligible = reset_flag if reset_flag is not None else str(dig(c, "state")).lower() == "enabled"
+        if eligible:
+            methods.append(str(dig(c, "id")))
     reset_methods = [m for m in methods if m in ("Email", "Sms", "Voice", "MicrosoftAuthenticator", "SoftwareOath")]
     if not reset_methods:
         add("medium", "sspr-no-method", "tenant", "enabledMethods=" + ",".join(methods)[:80], "self-service password reset has no usable verification method")

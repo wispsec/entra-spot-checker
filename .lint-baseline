@@ -1,4 +1,4 @@
-total 1290
+total 1276
 check entra-admin-unit-scope 5
 check entra-agent-identities 1
 check entra-api-scopes 7
@@ -110,7 +110,7 @@ check sub-dataplane 3
 check sub-defender 6
 check sub-defender-assessments 8
 check sub-defender-contacts 2
-check sub-defender-depth 14
+check sub-defender-depth 11
 check sub-deny-assignments 3
 check sub-deployments 3
 check sub-diag-content 8
@@ -133,7 +133,7 @@ check sub-locks-detail 1
 check sub-loganalytics 9
 check sub-management-groups 3
 check sub-mg-assignments 2
-check sub-mgmt-hierarchy 7
+check sub-mgmt-hierarchy 2
 check sub-net-path 9
 check sub-net-routes 6
 check sub-network-inventory 2
@@ -142,7 +142,6 @@ check sub-nsg 15
 check sub-orphans 4
 check sub-owners 6
 check sub-paas-auth 14
-check sub-pim-azure-approval 3
 check sub-policy 20
 check sub-policy-coverage 4
 check sub-policy-depth 4
@@ -156,7 +155,7 @@ check sub-rbac-write 5
 check sub-resource-diagnostics 15
 check sub-sentinel-depth 2
 check sub-sql 15
-check sub-sql-advanced 23
+check sub-sql-advanced 20
 check sub-sql-databases 15
 check sub-sql-firewall 12
 check sub-sql-orphans 17
