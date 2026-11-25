@@ -750,7 +750,9 @@ def finalize_coverage():
         misses = [u for u in UNATTRIBUTED if u[0] == name]
         if misses and c["status"] in ("ok", "empty", "absent"):
             c["status"] = "partial"
-            c["detail"] = str(len(misses)) + " findings carry no subscription attribution"
+            named = sorted({u[1] + "=" + u[2] for u in misses})
+            c["detail"] = (str(len(misses)) + " findings carry no subscription attribution: "
+                           + ", ".join(named[:3]) + (" +" + str(len(named) - 3) if len(named) > 3 else ""))
         c["denied"] = DENIED[name]
         if c["status"] == "failed":
             continue
