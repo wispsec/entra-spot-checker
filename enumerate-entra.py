@@ -335,6 +335,30 @@ def _classify(stderr):
     return "error"
 
 
+def _error_detail(text):
+    """The code and message of an az error body, else the first 200 characters.
+
+    A Resource Graph or ARM 400 carries a JSON body whose message names the fault.
+    The raw stderr is mostly boilerplate, so keep the parsed fields when they exist.
+    """
+    raw = str(text or "").strip()
+    start = raw.find("{")
+    if start >= 0:
+        try:
+            doc = json.loads(raw[start:])
+        except (ValueError, TypeError):
+            doc = None
+        if isinstance(doc, dict):
+            err = dig(doc, "error")
+            if not isinstance(err, dict):
+                err = doc
+            code = str(val(dig(err, "code"), ""))
+            msg = str(val(dig(err, "message"), ""))
+            if code or msg:
+                return (code + ": " + msg).strip(": ")[:200]
+    return raw[:200]
+
+
 def az(args, timeout=150, retries=3):
     global AZ_OK
     LAST_ERROR.update(kind="", detail="", booked="")
@@ -369,7 +393,7 @@ def az(args, timeout=150, retries=3):
             _tally_transport(parsed)
             return parsed
         kind = _classify(p.stderr)
-        LAST_ERROR.update(kind=kind, detail=(p.stderr or "")[:200])
+        LAST_ERROR.update(kind=kind, detail=_error_detail(p.stderr))
         transient = kind == "throttled" or re.search(r"\(\s*(500|502|503|504)\)", (p.stderr or "").lower())
         if transient and attempt < retries - 1:
             time.sleep(delay)
@@ -3123,7 +3147,15 @@ def c_dyn(ctx):
             "whoever can steer the rule decides who holds what the group grants")
         if sev in ("critical", "high"):
             segment = dig(ctx, "steer_writer", {}).get(gid) or STEER_LABEL[steer]
-            chain("dynamic-group-to-capability", segment + " -> " + group_node(ctx, gid) + " -> " + grants[0][1], sev, "a rule an outsider can satisfy grants this access")
+            for rank, sink in grants[:3]:
+                if steer in STEER_OPEN:
+                    sink_sev = ("low", "medium", "high", "critical")[rank]
+                else:
+                    sink_sev = (None, None, "low", "medium")[rank]
+                if sink_sev not in ("critical", "high"):
+                    continue
+                chain("dynamic-group-to-capability", segment + " -> " + group_node(ctx, gid) + " -> " + sink,
+                      sink_sev, "a rule an outsider can satisfy grants this access")
 
 
 @check("entra-attribute-writers")
@@ -9463,7 +9495,7 @@ def c_guest_sponsors(ctx):
 
 @check("sub-redis-auth")
 def c_redis_auth(ctx):
-    rows = arg_rows("Resources | where type =~ 'microsoft.cache/redis' | project name, subscriptionId, rg=resourceGroup, nonSsl=tostring(properties.enableNonSslPort), publicNet=tostring(properties.publicNetworkAccess), tls=tostring(properties.minimumTlsVersion), aad=tostring(properties.redisConfiguration.aad-enabled), accessKeys=tostring(properties.accessKeys)", ctx["subs"])
+    rows = arg_rows("Resources | where type =~ 'microsoft.cache/redis' | project name, subscriptionId, rg=resourceGroup, nonSsl=tostring(properties.enableNonSslPort), publicNet=tostring(properties.publicNetworkAccess), tls=tostring(properties.minimumTlsVersion), aad=tostring(properties.redisConfiguration['aad-enabled']), accessKeys=tostring(properties.accessKeys)", ctx["subs"])
     if rows is None:
         note("sub-redis-auth", 0, denied=1)
         return
