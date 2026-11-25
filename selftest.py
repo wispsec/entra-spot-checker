@@ -385,9 +385,9 @@ def regressions():
     assert len(hits) == 1 and hits[0]["severity"] == "high", hits
     assert "Partners steer=guest" in hits[0]["evidence"] and "IT steer=privileged" in hits[0]["evidence"], hits[0]["evidence"]
     assert [c["chain"] for c in M.CHAINS] == ["attribute-to-ca-bypass"], M.CHAINS
-    # No subscription in scope: RBAC unread, so the evidence must not claim the group grants nothing.
-    ev = [f["evidence"] for f in M.FINDINGS if f["check"] == "dynamic-group-steerable" and f["subject"] == "Partners"]
-    assert ev and "grants=not assessed" in ev[0], ev
+    # No subscription in scope: RBAC unread, so no severity is drawn for the steer.
+    assert not [f for f in M.FINDINGS if f["check"] == "dynamic-group-steerable"], M.FINDINGS
+    assert {f["check"] for f in M.FINDINGS if f["source"] == "entra-dynamic-groups"} == {"dynamic-group-rbac-unassessed", "dynamic-group-grant-unread", "dynamic-group-processing-paused"}, M.FINDINGS
     # Capability decides severity: a guest-steerable group holding Owner is critical.
     owner = "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
 

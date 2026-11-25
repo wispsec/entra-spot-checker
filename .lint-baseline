@@ -1,4 +1,4 @@
-total 1315
+total 1310
 check entra-admin-unit-scope 5
 check entra-agent-identities 1
 check entra-api-scopes 7
@@ -22,7 +22,7 @@ check entra-ca 32
 check entra-ca-inventory 15
 check entra-ca-matrix 5
 check entra-ca-roles 6
-check entra-ca-scope-detail 26
+check entra-ca-scope-detail 25
 check entra-ca-session 7
 check entra-ca-workload 4
 check entra-cba-config 7
@@ -96,7 +96,7 @@ check sub-appservice 16
 check sub-appservice-auth 10
 check sub-appservice-basic-auth 11
 check sub-appservice-net 6
-check sub-appservice-restrictions 8
+check sub-appservice-restrictions 4
 check sub-arc 4
 check sub-arm-orphans 4
 check sub-automation 12
