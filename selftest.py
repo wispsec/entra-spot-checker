@@ -355,8 +355,12 @@ def regressions():
         path = os.path.join(tmp, "c.dot")
         M.dot(path)
         text = open(path, encoding="utf-8").read()
-    assert text.count("[label=") == 6 and text.count(" -> ") == 5, text
-    assert "CH-01 a" in text and "CH-02 b" in text, text
+    edges = [line for line in text.splitlines() if "->" in line and "tooltip" not in line]
+    assert text.count('tooltip="') == 6 and len(edges) == 5, text
+    assert "CH-01 a:" in text and "CH-02 b:" in text, text
+    # The two shared hops stay one node each, not one node per chain.
+    assert text.count('tooltip="anyone who can invite a guest"') == 1, text
+    assert text.count('tooltip="group Partners"') == 1, text
     reset()
     # A peer-tenant truncation stays labelled with its tenant and stays on the peer check.
     reset()

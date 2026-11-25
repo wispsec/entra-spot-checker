@@ -24,6 +24,12 @@ import time
 from collections import Counter, defaultdict
 
 SEV = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+# Node and edge colour per severity in the --dot rendering.
+DOT_COLOR = {"critical": "#c62828", "high": "#e65100", "medium": "#f9a825",
+             "low": "#607d8b", "info": "#9e9e9e"}
+# Relation words a chain path embeds in a node label. The --dot rendering moves
+# them onto the edge, so a node names an entity and an edge names the relation.
+DOT_VERBS = ("owns", "role", "excluded from", "granted", "member of")
 VM_ATTACHED = ("/networkInterfaces/", "/virtualMachines/", "/virtualMachineScaleSets/")
 BUILTIN_ROLE_OWNER = "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
 BUILTIN_ROLE_UAA = "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9"
@@ -10278,57 +10284,132 @@ class Tee:
         self.fh.close()
 
 
-def _dot_label(text):
-    """A graphviz-safe single-line label, truncated to keep the graph readable."""
+def _dot_label(text, limit=200):
+    """A graphviz-safe single-line label, capped to keep one attribute readable."""
     raw = str(text).strip()
     for old, new in (("\\", "\\\\"), ('"', "'"), ("{", "("), ("}", ")"), ("[", "("), ("]", ")"), ("\n", " ")):
         raw = raw.replace(old, new)
-    return raw[:120]
+    return raw[:limit]
+
+
+def _dot_wrap(text, width=34, lines=4):
+    """Break a label into at most lines lines of about width characters.
+
+    A word longer than the width, such as a GUID or a user principal name, keeps
+    its own line unbroken: a split identifier is unreadable, and the tooltip
+    carries the full text anyway.
+    """
+    out = []
+    cur = ""
+    for word in str(text).split():
+        if not cur:
+            cur = word
+        elif len(cur) + 1 + len(word) <= width:
+            cur = cur + " " + word
+        else:
+            out.append(cur)
+            cur = word
+    if cur:
+        out.append(cur)
+    if len(out) > lines:
+        tail = " ".join(out[lines - 1:])
+        out = out[:lines - 1] + [tail[:width - 3] + "..."]
+    return out
+
+
+def _dot_split(label):
+    """Separate a leading relation word from an entity label."""
+    for verb in DOT_VERBS:
+        head = verb + " "
+        if label.startswith(head) and len(label) > len(head):
+            return verb, label[len(head):]
+    return "", label
+
+
+def _dot_tip(text, limit=200):
+    """A tooltip keeps the full text; the visible label may be shortened."""
+    raw = str(text)
+    if len(raw) <= limit:
+        return raw
+    return raw[:limit].rsplit(" ", 1)[0] + " ..."
 
 
 def dot(path, rows=None):
-    """Graphviz of the attack chains, one node per chain id and one per entity.
+    """Write a graphviz rendering of the attack chains.
 
-    Equal entity labels are one node, so paths that share an entity join. Chain
-    authors keep middle labels specific to one entity; a generic middle label would
-    join unrelated paths. Each chain has its own node, so the graph names the chain
-    rather than only its path.
+    One node per chain id and one per entity. A path embeds its relation word in
+    the node label ("owns <app>"); the rendering moves that word onto the edge, so
+    a node names an entity and an edge names the relation. Equal entity labels
+    collapse into one node, so paths that share an entity join. A chain node
+    carries the id and the severity only; the chain name and the full path live in
+    the tooltip, which keeps the layout narrow without losing text. Entities are
+    ranked in one column per hop depth, and a node takes the colour of the worst
+    severity that passes through it.
     """
     if rows is None:
         rows = [{"id": "CH-" + str(i + 1).zfill(2), "chain": c} for i, c in enumerate(CHAINS)]
-    items = rows
-    ids = {}
-    chain_nodes = set()
-    hot = set()
+    meta = {}
+    sinks = set()
     edges = {}
-    for row in items:
+    for row in rows:
         c = row["chain"]
-        cid = "c" + str(row["id"]).replace("-", "")
-        chain_nodes.add(cid)
-        ids[_dot_label(str(row["id"]) + " " + str(c["chain"]))] = cid
-        if c["severity"] in ("critical", "high"):
-            hot.add(cid)
+        severity = str(c["severity"])
+        cid = "chain|" + str(row["id"])
+        meta[cid] = {"label": _dot_label(str(row["id"])), "severity": severity, "depth": -1,
+                     "chain": True,
+                     "tooltip": _dot_label(str(row["id"]) + " " + str(c["chain"]) + ": " + str(c["path"]), 400)}
+        keys = []
         prev = None
-        first = None
-        for part in str(c["path"]).split(" -> "):
-            label = _dot_label(part)
+        for hop, part in enumerate(str(c["path"]).split(" -> ")):
+            verb, label = _dot_split(_dot_label(part))
             if not label:
                 continue
-            nid = ids.setdefault(label, "n%d" % len(ids))
-            if c["severity"] in ("critical", "high"):
-                hot.add(nid)
-            if first is None:
-                first = nid
-            if prev is not None and prev != nid:
-                edges[(prev, nid)] = True
-            prev = nid
-        if first is not None and first != cid:
-            edges[(cid, first)] = True
-    lines = ["digraph chains {", "  rankdir=LR;", "  node [shape=box, fontsize=10];"]
-    for label, nid in ids.items():
-        shape = ", shape=note" if nid in chain_nodes else ""
-        lines.append('  %s [label="%s", color=%s%s];' % (nid, label, "red" if nid in hot else "orange", shape))
-    lines += ["  %s -> %s;" % e for e in edges]
+            key = "entity|" + label
+            node = meta.get(key)
+            if node is None:
+                node = {"label": label, "severity": severity, "depth": hop, "chain": False, "tooltip": label}
+                meta[key] = node
+            elif SEV[severity] < SEV[node["severity"]]:
+                node["severity"] = severity
+            if hop > node["depth"]:
+                node["depth"] = hop
+            if prev is not None and prev != key:
+                edges.setdefault((prev, key), verb)
+            prev = key
+            keys.append(key)
+        if keys:
+            edges.setdefault((cid, keys[0]), "")
+            if len(keys) > 1:
+                sinks.add(keys[-1])
+    ids = {}
+    for key in sorted(meta):
+        ids[key] = ("c" if meta[key]["chain"] else "n") + str(len(ids))
+    lines = ["digraph chains {",
+             "  rankdir=LR;",
+             '  graph [fontname="Helvetica", nodesep=0.35, ranksep=0.85, splines=true, overlap=false, pad=0.2];',
+             '  node [shape=box, style="filled", fillcolor=white, fontname="Helvetica", fontsize=10, penwidth=1.4, margin="0.10,0.05"];',
+             '  edge [color="#8a8a8a", arrowsize=0.7];']
+    for key in sorted(meta):
+        node = meta[key]
+        color = DOT_COLOR.get(node["severity"], DOT_COLOR["info"])
+        if node["chain"]:
+            attrs = 'shape=note, fillcolor="%s", color="%s", fontcolor=white' % (color, color)
+            label = node["label"] + "\\n" + node["severity"]
+        else:
+            attrs = 'shape=%s, color="%s", fontcolor="#222222"' % ("ellipse" if key in sinks else "box", color)
+            label = "\\n".join(_dot_wrap(node["label"]))
+        lines.append('  %s [label="%s", %s, tooltip="%s"];' % (ids[key], label, attrs, _dot_tip(node["tooltip"])))
+    columns = {}
+    for key, node in meta.items():
+        columns.setdefault(node["depth"], []).append(ids[key])
+    for depth in sorted(columns):
+        lines.append("  {rank=same; " + "; ".join(sorted(columns[depth])) + ";}")
+    for left, right in sorted(edges):
+        verb = edges[(left, right)]
+        if verb:
+            lines.append('  %s -> %s [label="%s"];' % (ids[left], ids[right], verb))
+        else:
+            lines.append("  %s -> %s;" % (ids[left], ids[right]))
     lines.append("}")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
