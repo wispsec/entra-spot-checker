@@ -91,6 +91,17 @@ def _run(name, ctx, **fakes):
     return {f["check"] for f in M.FINDINGS}
 
 
+def path_reads():
+    """dig() resolves a key that contains a dot, and a path that does not exist."""
+    assert M.dig({"@odata.type": "#microsoft.graph.group"}, "@odata.type") == "#microsoft.graph.group"
+    assert M.dig({"@odata": {"nextLink": "u"}}, "@odata.nextLink") == "u"
+    assert M.dig({"a": {"b": {"c": 2}}}, "a.b.c") == 2
+    assert M.dig({"a": {"b.c": 1}}, "a.b.c") == 1
+    assert M.dig({"a": 1}, "a.z", "absent") == "absent"
+    assert M.dig(None, "a", "absent") == "absent"
+    assert M.dig({"a": {"b": 3}}, ("a", "b")) == 3
+
+
 def regressions():
     """Semantic cases the failure-path sweep cannot see."""
     real_run = M.subprocess.run
@@ -660,6 +671,108 @@ def payloads():
          {"graph_all": ga_defs, "ca_all": lambda *a, **k: None,
           "graph": lambda p, *a, **k: {"value": []} if "methods" in p else {"displayName": "A"}},
          ("breakglass-exclusion-unread",), ("breakglass-not-excluded",), None),
+        ("a dotted key resolves instead of splitting", "entra-custom-roles", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "R", "rolePermissions": [
+             {"allowedResourceActions": ["microsoft.directory/users/authenticationMethods/standard/restore"]}]}]},
+         ("custom-role-escalation-action",), (), None),
+        ("the PIM policy carries its activation rules", "entra-pim-policy", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "P", "rules": [
+             {"@odata.type": "#microsoft.graph.unifiedRoleManagementPolicyEnablementRule",
+              "enabledRules": ["MultiFactorAuthentication", "Justification"]}]}]},
+         ("pim-policy",), ("pim-activation-no-mfa", "pim-rules-unread"), None),
+        ("a policy with no rules is not a missing second factor", "entra-pim-policy", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "P", "rules": []}]},
+         ("pim-rules-unread",), ("pim-activation-no-mfa",), None),
+        ("ticketing is an enabled rule, not a rule type", "entra-pim-activation-rules", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "P", "rules": [
+             {"@odata.type": "#microsoft.graph.unifiedRoleManagementPolicyEnablementRule",
+              "enabledRules": ["MultiFactorAuthentication", "Justification", "Ticketing"]}]}]},
+         (), ("pim-no-ticketing",), None),
+        ("a mixed-case escalation action still matches", "entra-custom-roles", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "R", "rolePermissions": [
+             {"allowedResourceActions": ["microsoft.directory/oauth2PermissionGrants/allProperties/allTasks"]}]}]},
+         ("custom-role-escalation-action",), (), None),
+        ("the restricted consent default is not broad consent", "entra-consent-grant-policy", {"subs": []},
+         {"graph_all": lambda *a, **k: [],
+          "graph": lambda *a, **k: {"defaultUserRolePermissions": {
+              "permissionGrantPoliciesAssigned": ["managePermissionGrantsForSelf.microsoft-user-default-low"]}}},
+         ("consent-restricted-by-default",), ("no-consent-grant-policy",), None),
+        ("a wildcard on one domain is not a top-level domain", "sub-firewall-rules", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "fw", "rule": "r", "action": "Allow", "src": "*",
+                                        "dst": "*", "port": "443", "fqdn": '["*.contoso.com"]',
+                                        "subscriptionId": "s1"}]},
+         ("firewall-fqdn-wildcard",), ("firewall-fqdn-wildcard-broad",), None),
+        ("a wildcard on a public suffix is a top-level domain", "sub-firewall-rules", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "fw", "rule": "r", "action": "Allow", "src": "10.0.0.1",
+                                        "dst": "10.0.0.2", "port": "443", "fqdn": '["*.co.uk"]',
+                                        "subscriptionId": "s1"}]},
+         ("firewall-fqdn-wildcard-broad",), ("firewall-fqdn-wildcard",), None),
+        ("a dropped default route is not an internet default route", "sub-net-routes", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "rt", "route": "r", "hop": "None",
+                                        "addr": "0.0.0.0/0", "subscriptionId": "s1"}]},
+         ("route-default-dropped",), ("route-default-to-internet",), None),
+        ("an unreturned rotation flag is not a disabled rotation", "sub-aks-kv-provider", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "aks", "subscriptionId": "s1", "kv": "true", "csi": "",
+                                        "ident": "SystemAssigned", "kubelet": "k1"}]},
+         ("aks-kv-secret-rotation-unknown",), ("aks-kv-secret-rotation-off",), None),
+        ("an unreturned multi-user authorisation state is not off", "sub-backup-vault-posture", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "v", "subscriptionId": "s1",
+                                        "props": {"securitySettings": {"softDeleteSettings": {"softDeleteState": "Enabled"}}}}]},
+         ("backup-vault-mua-unknown",), ("backup-vault-mua-off",), None),
+        ("the App Insights retention property is Pascal case", "sub-appinsights-keys", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "appi", "subscriptionId": "s1", "localAuth": "true",
+                                        "retention": "30", "publicIngest": ""}]},
+         ("appinsights-short-retention",), (), None),
+        ("data sources are read by type, not as a list", "sub-datacollection", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "dcr", "subscriptionId": "s1", "ident": "SystemAssigned",
+                                        "syslog": 2}]},
+         ("dcr-syslog",), (), None),
+        ("Sms is a reset method id", "entra-sspr", {"subs": []},
+         {"graph": lambda p, *a, **k: ({"authenticationMethodConfigurations": [{"id": "Sms", "state": "enabled"}]}
+                                       if "authenticationMethodsPolicy" in p
+                                       else {"defaultUserRolePermissions": {"allowedToUseSSPR": False}})},
+         ("sspr-single-method",), ("sspr-no-method",), None),
+        ("a Block policy for named users leaves legacy clients open", "entra-legacy-auth-block", {"subs": []},
+         {"ca_all": lambda *a, **k: [{"state": "enabled", "displayName": "P",
+                                      "conditions": {"clientAppTypes": ["exchangeActiveSync", "other"],
+                                                     "users": {"includeUsers": ["u1"]}},
+                                      "grantControls": {"builtInControls": ["block"]}}]},
+         ("legacy-block-narrow", "ca-legacy-auth-not-blocked"), ("legacy-auth-blocked",), None),
+        ("a compliant-device policy does not require MFA", "entra-mfa-baseline", {"subs": []},
+         {"graph": lambda *a, **k: {"isEnabled": False},
+          "ca_all": lambda *a, **k: [{"state": "enabled", "displayName": "P",
+                                      "conditions": {"users": {"includeUsers": ["All"]},
+                                                     "applications": {"includeApplications": ["All"]}},
+                                      "grantControls": {"builtInControls": ["compliantDevice"]}}],
+          "_strengths": lambda: {}},
+         ("mfa-not-required-for-all",), ("mfa-control-unread",), None),
+        ("a subscription with no Sentinel content is named", "sub-sentinel-depth", {"subs": ["s1", "s2"]},
+         {"arg_rows": lambda *a, **k: [{"type": "microsoft.securityinsights/alertrules", "subscriptionId": "s1", "n": 3}]},
+         ("sentinel-absent", "sentinel-missing-content"), (), lambda: [f["subscription"] for f in evidence("sentinel-absent")] == ["s2"]),
+        ("an exclusion through a group counts as an exclusion", "entra-breakglass-hardening", {"subs": []},
+         {"graph_all": lambda p, *a, **k: ([{"id": "d1", "templateId": ga, "displayName": "Global Administrator"}]
+                                           if "roleDefinitions" in p else [{"principalId": "u1", "roleDefinitionId": "d1"}]),
+          "ca_all": lambda *a, **k: [{"state": "enabled", "displayName": "P",
+                                      "conditions": {"users": {"excludeGroups": ["g1"]}}}],
+          "graph": lambda p, *a, **k: ({"value": [{"id": "g1"}]} if "transitiveMemberOf" in p
+                                       else {"displayName": "Emergency", "userPrincipalName": "bg@x",
+                                             "accountEnabled": True})},
+         ("breakglass-excluded",), ("breakglass-not-excluded",), None),
+        ("a service principal with no application object has no readable manifest", "entra-app-overscope", {"subs": []},
+         {"graph_all": lambda p, *a, **k: ([{"clientId": "sp1", "resourceId": "sp2", "scope": "User.Read"}]
+                                           if "oauth2PermissionGrants" in p else
+                                           ([] if "applications" in p else
+                                            [{"id": "sp1", "appId": "a1", "displayName": "Client"},
+                                             {"id": "sp2", "appId": "00000003-0000-0000-c000-000000000000",
+                                              "displayName": "Graph"}]))},
+         ("grant-manifest-unreadable",), ("grant-without-manifest-scope",), None),
+        ("a failed owner read does not become 'no human owner'", "sub-azure-takeover", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"principalId": "sp1", "roleId": "8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
+                                        "scope": "/subscriptions/s1"}],
+          "graph": lambda p, *a, **k: (None if "owners" in p else
+                                       {"id": "sp1", "appId": "a1", "displayName": "SP",
+                                        "servicePrincipalType": "Application"})},
+         (), ("azure-privileged-sp-no-human-owner",), None),
     ]
     fails = []
     try:
@@ -681,6 +794,7 @@ def payloads():
 
 def main():
     invariants()
+    path_reads()
     regressions()
     fails = payloads()
     if fails:

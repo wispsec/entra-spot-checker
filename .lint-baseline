@@ -1,4 +1,4 @@
-total 1309
+total 1298
 check entra-admin-unit-scope 5
 check entra-agent-identities 1
 check entra-api-scopes 7
@@ -16,7 +16,7 @@ check entra-auth-methods 4
 check entra-auth-methods-detail 19
 check entra-auth-methods-policy 12
 check entra-authenticator-features 5
-check entra-authorization-policy 13
+check entra-authorization-policy 11
 check entra-breakglass 6
 check entra-ca 32
 check entra-ca-inventory 15
@@ -65,7 +65,6 @@ check entra-nested-role-groups 6
 check entra-organization 5
 check entra-password-policy 1
 check entra-pim-depth 3
-check entra-pim-policy 2
 check entra-pim-role-settings 11
 check entra-public-groups 2
 check entra-redirect-uri 5
@@ -134,7 +133,7 @@ check sub-locks 1
 check sub-locks-detail 1
 check sub-loganalytics 9
 check sub-management-groups 3
-check sub-mg-assignments 5
+check sub-mg-assignments 2
 check sub-mgmt-hierarchy 7
 check sub-net-path 9
 check sub-net-routes 6
@@ -150,19 +149,19 @@ check sub-policy-coverage 4
 check sub-policy-depth 4
 check sub-policy-notscopes 3
 check sub-private-dns 7
-check sub-private-endpoints 7
+check sub-private-endpoints 5
 check sub-privileged-roles 9
 check sub-public-ips 4
 check sub-rbac-scope-breadth 3
 check sub-rbac-write 5
 check sub-resource-diagnostics 15
 check sub-sentinel-depth 2
-check sub-sql 16
+check sub-sql 15
 check sub-sql-advanced 23
 check sub-sql-databases 15
 check sub-sql-firewall 12
 check sub-sql-orphans 17
-check sub-sql-outbound 4
+check sub-sql-outbound 3
 check sub-storage 9
 check sub-storage-advanced 13
 check sub-storage-cmk 4

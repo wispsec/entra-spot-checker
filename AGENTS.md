@@ -87,6 +87,14 @@ or `unreadable`. `Index` raises `DatasetUnavailable` when a check reads from a
 dataset that is not `ok`. The runner records `absent` coverage for that check.
 Never turn an unreadable input into a clean negative finding.
 
+### A path segment may contain a dot
+
+`dig()` tries the whole remaining string as one key before it splits at the
+first dot. `dig(page, "@odata.nextLink")` and `dig(rule, "@odata.type")` resolve;
+a plain `path.split(".")` returns `MISSING` for both, and `str(MISSING)` is the
+empty string, so the mistake is silent. Prefer `dig()` over `obj.get("a.b")` and
+over a hand-written split.
+
 ### Check identity comes from the registry
 
 `REGISTRY_NAMES` is filled by the `@check` decorator. `note()` and `deny()` route

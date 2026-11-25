@@ -759,7 +759,7 @@ def finalize_coverage():
         c = COVERAGE.setdefault(name, {"examined": 0, "denied": 0, "status": "ok"})
         t = _transport_entry(name) if name in TRANSPORT else None
         if t and t["calls"]:
-            if int(t["rows"]) > int(c["examined"]):
+            if int(t["rows"]) > 0 and not c["examined"]:
                 c["examined"] = int(t["rows"])
             kinds = t["fail"]
             if kinds.get("error") or kinds.get("unavailable") or kinds.get("unauthenticated"):
@@ -1181,6 +1181,7 @@ def sample(check, shown, total, what="records"):
     """Record a deliberate sample: the area is assessed, the listed remainder is not."""
     if total and shown < total:
         c = COVERAGE.setdefault(check, {"examined": 0, "denied": 0, "status": "ok"})
+        c["examined"] = min(c["examined"], shown) if c["examined"] else shown
         c["detail"] = "sampled " + str(shown) + " of " + str(total) + " " + str(what)
         if c["status"] in ("ok", "empty"):
             c["status"] = "sampled"
@@ -1201,6 +1202,7 @@ def trunc(check, shown, total, what="records"):
     if total and shown < total:
         TRUNC_CHECKS.add(check)
         c = COVERAGE.setdefault(check, {"examined": 0, "denied": 0, "status": "ok"})
+        c["examined"] = min(c["examined"], shown) if c["examined"] else shown
         if c["status"] not in ("partial", "error"):
             c["status"] = "truncated"
             c["detail"] = str(shown) + " of " + str(total) + " " + str(what)
@@ -1336,7 +1338,7 @@ PREFIX_RULES = (
     ("policy", "GOV-"), ("locks", "GOV-"), ("deny-assignments", "GOV-"), ("management-groups", "GOV-"),
     ("backup", "BCK-"), ("storage-lifecycle", "ST-"), ("template-specs", "GOV-"),
     ("deployments", "SEC-"), ("owners", "ID-"), ("lighthouse", "ID-"), ("classic", "ID-"),
-    ("entra-ds", "DS-"), ("paas", "PAAS-"), ("datapane", "SCOPE-"), ("dataplane", "SCOPE-"),
+    ("entra-ds", "DS-"), ("paas", "PAAS-"), ("dataplane", "SCOPE-"),
     ("entra-ca", "CA-"), ("stale-privileged", "ID-"), ("scim", "APP-"), ("deleted-users", "ID-"),
     ("kv-legacy", "KV-"), ("abac", "ID-"), ("disk", "ST-"), ("acr", "ACR-"),
     ("flexible-server", "DB-"), ("arc", "ARC-"), ("data-platform", "DATA-"), ("law-", "LOG-"),
@@ -1426,10 +1428,10 @@ PREFIX_RULES = (
     ("guest-invite-modes", "ID-"), ("ca-unconfirmed-empty", "CA-"), ("licence-unreadable", "GOV-"),
     ("seamless-sso-key-rotation-unverifiable", "ID-"), ("seamless-sso-not-applicable", "ID-"), ("seamless-sso-agent-groups", "ID-"),
     ("pta-not-applicable", "ID-"), ("pta-agent-group", "ID-"), ("token-lifetime-policy", "AUTH-"),
-    ("ca-roles-unconstrained", "CA-"),
+    ("ca-roles-unconstrained", "CA-"), ("legacy-block-narrow", "CA-"),
     ("no-signin-frequency", "CA-"), ("signin-frequency", "CA-"), ("global-administrator-count", "ID-"),
     ("single-global-administrator", "ID-"), ("multitenant-application", "APP-"), ("no-multitenant-apps", "APP-"),
-    ("grant-without-manifest-scope", "APP-"), ("grant-not-in-manifest", "APP-"), ("grant-declared", "APP-"), ("advisor-", "GOV-"),
+    ("grant-without-manifest-scope", "APP-"), ("grant-not-in-manifest", "APP-"), ("grant-declared", "APP-"), ("grant-manifest-unreadable", "APP-"), ("advisor-", "GOV-"),
     ("private-endpoint-no-dns-zone", "NW-"), ("aks-api-public", "AKS-"), ("aks-no-network-policy", "AKS-"),
     ("vnet-no-ddos-plan", "NW-"), ("no-ddos-plan", "NW-"),
     ("no-user-risk-policy", "ID-"), ("no-signin-risk-policy", "ID-"), ("user-risk-policy", "ID-"), ("signin-risk-policy", "ID-"),
@@ -1878,11 +1880,30 @@ def tally(resolved):
 
 
 def dig(obj, path, default=MISSING):
+    """Read a nested property. A path segment may contain a dot, as in @odata.type.
+
+    The literal remainder is tried before the first segment, so a key such as
+    "@odata.nextLink" resolves instead of splitting into "@odata" and "nextLink".
+    """
+    if not isinstance(path, str):
+        cur = obj
+        for part in path:
+            if not isinstance(cur, dict) or part not in cur:
+                return default
+            cur = cur[part]
+        return cur
     cur = obj
-    for part in path.split("."):
-        if not isinstance(cur, dict) or part not in cur:
+    rest = path
+    while rest:
+        if not isinstance(cur, dict):
             return default
-        cur = cur[part]
+        if rest in cur:
+            return cur[rest]
+        head, sep, tail = rest.partition(".")
+        if not sep or head not in cur:
+            return default
+        cur = cur[head]
+        rest = tail
     return cur
 
 
@@ -1916,6 +1937,40 @@ def allow_deny(value):
     if text_value in ("deny", "false", "disabled"):
         return False
     return None
+
+
+CONSENT_LEGACY = "microsoft-user-default-legacy"
+CONSENT_RESTRICTED = "microsoft-user-default-low"
+SUFFIX_CATEGORY = {"co", "com", "org", "net", "ac", "gov", "edu", "or", "ne", "go", "gob", "mil", "sch"}
+
+
+def consent_breadth(value):
+    """Breadth of a permissionGrantPoliciesAssigned value: broad, restricted or custom.
+
+    An unset value leaves the historical default in force, which lets a user consent
+    to any permission. A value naming a policy this run did not read is custom.
+    """
+    text = str(val(value, "")).lower()
+    if not text or CONSENT_LEGACY in text:
+        return "broad"
+    if CONSENT_RESTRICTED in text:
+        return "restricted"
+    return "custom"
+
+
+def wildcard_scope(target):
+    """tld, public-suffix or domain for a wildcard FQDN.
+
+    A two-label suffix such as co.uk is a public suffix when its first label names a
+    registry category; contoso.com is one organisation's domain.
+    """
+    host = target[2:] if target.startswith("*.") else target
+    labels = [p for p in host.split(".") if p]
+    if len(labels) <= 1:
+        return "tld"
+    if len(labels) == 2 and labels[0].lower() in SUFFIX_CATEGORY:
+        return "public-suffix"
+    return "domain"
 
 
 def num(value, default=MISSING):
@@ -1969,6 +2024,7 @@ KV_FIELDS = {
     "ipRules": ("properties.networkAcls.ipRules", lambda v: len(v) if isinstance(v, list) else tally(False) or None),
     "vnetRules": ("properties.networkAcls.virtualNetworkRules", lambda v: len(v) if isinstance(v, list) else None),
     "ipRulesRaw": ("properties.networkAcls.ipRules", lambda v: v if isinstance(v, list) else tally(False) or []),
+    "pe": ("properties.privateEndpointConnections", lambda v: len(v) if isinstance(v, list) else None),
     "purge": ("properties.enablePurgeProtection", tri),
     "soft": ("properties.enableSoftDelete", tri),
     "softDays": ("properties.softDeleteRetentionInDays", num),
@@ -2188,8 +2244,12 @@ def c_sql(ctx):
         aud = az(["rest", "--url", base + "/auditingSettings/default?api-version=2021-11-01"])
         if aud is None:
             deny("sub-sql")
-        elif (aud.get("properties") or {}).get("state") != "Enabled":
-            add("medium", "sql-auditing-disabled", r.get("name"), "auditingSettings.state != Enabled", "no query audit trail", s)
+        else:
+            state = str(val(dig(aud, "properties.state"), ""))
+            if not state:
+                add("low", "sql-auditing-unknown", r.get("name"), "auditingSettings.state not returned", "the audit trail cannot be confirmed", s)
+            elif state.lower() != "enabled":
+                add("medium", "sql-auditing-disabled", r.get("name"), "auditingSettings.state=" + state, "no query audit trail", s)
 
 
 
@@ -2343,9 +2403,11 @@ def c_policy(ctx):
     subs = ctx["subs"]
     rows = arg_rows(
         "PolicyResources | where type =~ 'microsoft.authorization/policyexemptions'"
+        " | where subscriptionId in (" + subq(subs) + ") or isempty(tostring(subscriptionId))"
         " | project name, subscriptionId, cat=properties.exemptionCategory, exp=properties.expiresOn,"
-        " assignment=properties.policyAssignmentId, scope=tostring(properties.resourceId)",
+        " assignment=properties.policyAssignmentId, scope=tostring(id)",
         subs,
+        scoped=False,
     )
     if rows is None:
         note("sub-policy", 0, denied=1)
@@ -2611,6 +2673,7 @@ def c_azure_takeover(ctx):
         holders[str(dig(r, "principalId"))].append(r)
     sample("sub-azure-takeover", min(len(holders), 25), len(holders), "control-plane identities")
     taken = 0
+    unassessed = 0
     for pid in sorted(holders)[:25]:
         first = holders[pid][0]
         sub = ctx_sub(first)
@@ -2618,6 +2681,7 @@ def c_azure_takeover(ctx):
         scope = scopes[0] if scopes else "tenant"
         sp = graph("servicePrincipals/" + pid + "?$select=id,displayName,appId,servicePrincipalType")
         if sp is None:
+            unassessed += 1
             if az_kind() != "absent":
                 denied_now("sub-azure-takeover")
                 add("info", "app-owner-takeover-unassessed", pid, "control-plane role holder unreadable scope=" + scope[:60], "the identity behind this Azure role assignment was not resolved", sub, scope)
@@ -2627,6 +2691,7 @@ def c_azure_takeover(ctx):
         if kind == "ManagedIdentity":
             continue
         if not kind:
+            unassessed += 1
             add("info", "app-owner-takeover-unassessed", name, "servicePrincipalType not returned scope=" + scope[:60], "a workload identity holds control-plane access; ownership was not assessed", sub, scope)
             continue
         app_id = str(val(dig(sp, "appId"), ""))
@@ -2637,6 +2702,7 @@ def c_azure_takeover(ctx):
         for via, path in sources:
             owners = graph(path)
             if owners is None:
+                unassessed += 1
                 if az_kind() != "absent":
                     denied_now("sub-azure-takeover")
                     add("info", "app-owner-takeover-unassessed", name, via + " owners unreadable scope=" + scope[:60], "owners of this control-plane identity were not assessed", sub, scope)
@@ -2654,9 +2720,10 @@ def c_azure_takeover(ctx):
                   "high", "credential injection reaches the Azure control plane")
             break
         if not owned and az_kind() == "absent":
+            unassessed += 1
             add("info", "app-owner-takeover-unassessed", name, "no owner list reachable scope=" + scope[:60], "the identity is not owned from this directory; ownership sits in its publisher tenant", sub, scope)
-    if holders and not taken:
-        add("info", "azure-privileged-sp-no-human-owner", "tenant", "holders=" + str(len(holders)) + " humanOwned=0", "no control-plane identity has a human owner; credential custody is not person-linked")
+    if holders and not taken and not unassessed:
+        add("info", "azure-privileged-sp-no-human-owner", "tenant", "holders=" + str(len(holders)) + " inspected=" + str(min(len(holders), 25)) + " humanOwned=0", "none of the inspected control-plane identities has a human owner; credential custody is not person-linked")
 
 
 @check("sub-public-ips")
@@ -2819,7 +2886,7 @@ def c_approle_orphans(ctx):
             if resolved is None and reason != "absent":
                 continue
             if resolved is None:
-                add("medium", "orphaned-app-role-assignment", idx.name(s) + " " + str(pid), "resource=" + str(a.get("resourceDisplayName")), "app role still granted to a principal that no longer exists")
+                add("medium", "orphaned-app-role-assignment", idx.name(s) + " " + str(pid), "resource=" + str(a.get("resourceDisplayName")), "app role still granted to a principal that no longer exists", "tenant")
     note("sub-approle-orphans", n, denied=DENIED["sub-approle-orphans"])
 
 
@@ -2864,9 +2931,9 @@ def c_datapane(ctx):
                 continue
             ok += 1
             kind = "data-plane" if label in ("keyvault-secrets", "acr-repositories", "redis-keys") else "control-plane key read"
-            add("high", "datapane-secret-readable" if kind == "data-plane" else "controlplane-key-readable", str(r.get("name")) + " " + label, "kind=" + kind, "the audit identity can read this credential material", r.get("subscriptionId"))
+            add("high", "dataplane-secret-readable" if kind == "data-plane" else "controlplane-key-readable", str(r.get("name")) + " " + label, "kind=" + kind, "the audit identity can read this credential material", r.get("subscriptionId"))
         if rows:
-            add("info", "datapane-probe", label, "resources=" + str(len(rows)) + " allowed=" + str(ok) + " denied=" + str(denied), "data plane not assessed unless allowed>0")
+            add("info", "dataplane-probe", label, "resources=" + str(len(rows)) + " allowed=" + str(ok) + " denied=" + str(denied), "data plane not assessed unless allowed>0", "tenant")
     note("sub-dataplane", total, denied=DENIED["sub-dataplane"])
 
 
@@ -3099,7 +3166,7 @@ def _group_capabilities(ctx, gids):
     if not ctx.get("subs"):
         undecided("dynamic-group-rbac-unassessed", "subscriptions=0", "no subscription in scope; Azure RBAC granted to dynamic groups was not read")
         return caps, set(gids)
-    rows = unread(arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where tostring(properties.principalType) =~ 'Group' | project principalId=tostring(properties.principalId), roleId=tolower(tostring(properties.roleDefinitionId)), scope=tostring(properties.scope), subscriptionId", ctx["subs"]),
+    rows = unread(arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where tostring(properties.principalType) =~ 'Group' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project principalId=tostring(properties.principalId), roleId=tolower(tostring(properties.roleDefinitionId)), scope=tostring(properties.scope), subscriptionId", ctx["subs"], scoped=False),
                   "Azure role assignments to groups", "dynamic-group-rbac-unassessed")
     defs = unread(arg_rows(tenant_wide("AuthorizationResources | where type =~ 'microsoft.authorization/roledefinitions' | project id=tolower(id), name=tostring(properties.roleName), perms=properties.permissions"), ctx["subs"], scoped=False),
                   "Azure role definitions", "dynamic-group-rbac-unassessed")
@@ -3146,8 +3213,8 @@ def c_dyn(ctx):
         if state.lower() == "paused":
             add("low", "dynamic-group-processing-paused", label, "membershipRuleProcessingState=Paused", "membership is frozen; the rule no longer decides who is in the group")
         grants = sorted(caps.get(gid, []), reverse=True)
-        if not grants and gid in blind:
-            unread_steers.append(label + " steer=" + steer)
+        if gid in blind:
+            unread_steers.append(label + " steer=" + steer + " knownGrants=" + str(len(grants)))
             continue
         top = grants[0][0] if grants else 0
         if steer in STEER_OPEN:
@@ -3205,7 +3272,8 @@ def c_attribute_writers(ctx):
         if label:
             holders[label] += 1
     try:
-        synced = any(tri(dig(ctx["idx"].props(u), "onPremisesSyncEnabled")) is True for u in ctx["idx"].users())
+        states = {tri(dig(ctx["idx"].props(u), "onPremisesSyncEnabled")) for u in ctx["idx"].users()}
+        synced = True if True in states else (False if states == {False} else None)
     except DatasetUnavailable:
         synced = None
     examined = 0
@@ -3775,6 +3843,8 @@ def c_partners(ctx):
         add("info", "cross-tenant-partner", p.get("tenantId"), "b2bInbound=" + str(bool(p.get("b2bCollaborationInbound"))), "per-partner configuration present")
 
 
+GA_TEMPLATE = "62e90394-69f5-4237-9190-012177145e10"
+
 ROLE_TEMPLATE_IDS = {
     "62e90394-69f5-4237-9190-012177145e10": "GA",
     "e8611ab8-c189-46e8-94e1-60213ab1f814": "PRA",
@@ -4034,7 +4104,7 @@ def c_breakglass(ctx):
     for p in pols:
         target = excluded if p.get("state") == "enabled" else excluded_dead
         target.update(((p.get("conditions") or {}).get("users") or {}).get("excludeUsers") or [])
-    note("entra-breakglass", len(excluded))
+    note("entra-breakglass", len(pols))
     if excluded_dead - excluded:
         add("info", "breakglass-excluded-only-in-dead-policy", "tenant", "accounts=" + str(len(excluded_dead - excluded)), "those exclusions apply to no enforced policy")
     add("info", "breakglass-exclusion-scope", "tenant", "excludedFromEnabledPolicies=" + str(len(excluded)) + " enabledPolicies=" + str(len([p for p in pols if str(dig(p, "state")) == "enabled"])), "an exclusion set is measured per policy; being excluded from one policy is not being excluded from all")
@@ -4444,7 +4514,7 @@ def c_ra_groups(ctx):
 
 @check("entra-access-package-approval")
 def c_package_approval(ctx):
-    packs = graph_all("identityGovernance/entitlementManagement/accessPackages?$expand=assignmentPolicies", limit=5)
+    packs = graph_all("identityGovernance/entitlementManagement/accessPackages?$expand=assignmentPolicies,incompatibleAccessPackages", limit=5)
     if packs is None:
         note("entra-access-package-approval", 0, denied=1)
         return
@@ -4457,7 +4527,7 @@ def c_package_approval(ctx):
             expiration = dig(ap, "expiration")
             if not dig(expiration, "endDateTime") and str(val(dig(expiration, "type"), "")).lower() not in ("afterdatetime", "afterduration"):
                 add("medium", "access-package-no-expiry", dig(p, "displayName"), "policy=" + str(dig(ap, "displayName")) + " expiration=" + str(val(dig(expiration, "type"), "unset")), "granted access never expires")
-            if tri(dig(ap, "isRequestorJustificationRequired")) is not True:
+            if tri(dig(ap, "requestApprovalSettings.isRequestorJustificationRequired")) is not True:
                 add("low", "access-package-no-justification", dig(p, "displayName"), "policy=" + str(dig(ap, "displayName")), "requests carry no stated reason")
         incompatible = lst(dig(p, "incompatibleAccessPackages"))
         if incompatible:
@@ -4698,9 +4768,12 @@ def c_authzpolicy(ctx):
         add("medium", "guest-role-unknown", "tenant", "guestUserRoleId=" + (gur or "unset"), "the guest permission level is not one of the three documented roles")
     if pol.get("blockMsolPowerShell") is False:
         add("low", "msol-powershell-allowed", "tenant", "blockMsolPowerShell=false", "legacy MSOnline path remains available")
-    assigned = pol.get("permissionGrantPolicyIdsAssignedToDefaultUserRole") or []
-    if any("managePermissionGrantsForSelf" in str(a) for a in assigned):
-        add("high", "user-consent-to-apps-enabled", "tenant", "permissionGrantPolicyIdsAssignedToDefaultUserRole=" + ",".join([str(a) for a in assigned][:4]), "users can grant app permissions without an administrator")
+    assigned = lst(dig(pol, "permissionGrantPolicyIdsAssignedToDefaultUserRole"))
+    breadth = consent_breadth(",".join(str(a) for a in assigned))
+    if breadth == "broad":
+        add("high", "user-consent-to-apps-enabled", "tenant", "permissionGrantPolicyIdsAssignedToDefaultUserRole=" + (",".join([str(a) for a in assigned][:4]) or "unset"), "users can grant app permissions without an administrator")
+    elif breadth == "custom":
+        undecided("user-consent-policy-unresolved", "assigned=" + ",".join(str(a) for a in assigned)[:80], "a grant policy is assigned but was not read, so the consent breadth is unknown")
     if d.get("allowedToCreateTenants"):
         add("medium", "users-can-create-tenants", "tenant", "defaultUserRolePermissions.allowedToCreateTenants=true", "users can create tenants outside the governance boundary")
     if d.get("allowedToReadBitlockerKeysForOwnedDevice"):
@@ -4969,20 +5042,24 @@ def c_customroles(ctx):
         for perm in r.get("rolePermissions") or []:
             actions.extend(perm.get("allowedResourceActions") or [])
         wild = [a for a in actions if a.endswith("allTasks") or a == "*" or "allProperties" in a]
-        escalation = [a for a in actions if any(t in str(a).lower() for t in (
-            "microsoft.directory/users/password/update",
-            "microsoft.directory/users/authenticationMethods/",
-            "microsoft.directory/applications/credentials/update",
-            "microsoft.directory/servicePrincipals/credentials/update",
-            "microsoft.directory/applications/appRoles/update",
-            "microsoft.directory/servicePrincipals/appRoleAssignments/",
-            "microsoft.directory/oauth2PermissionGrants/",
-            "microsoft.directory/roleManagement/",
-            "microsoft.directory/groups/members/update"))]
+        escalation = [a for a in actions if any(t in str(a).lower() for t in ESCALATION_ACTIONS)]
         if wild:
             add("high", "custom-role-broad-actions", dig(r, "displayName"), "actions=" + str(len(actions)) + " broad=" + ",".join(wild[:4]), "custom role grants near-administrative breadth")
         if escalation:
             add("high", "custom-role-escalation-action", dig(r, "displayName"), "actions=" + ",".join(sorted(set(escalation))[:4]), "the role can reset credentials, grant consent, or change role membership")
+
+
+ESCALATION_ACTIONS = (
+    "microsoft.directory/users/password/update",
+    "microsoft.directory/users/authenticationmethods/",
+    "microsoft.directory/applications/credentials/update",
+    "microsoft.directory/serviceprincipals/credentials/update",
+    "microsoft.directory/applications/approles/update",
+    "microsoft.directory/serviceprincipals/approleassignments/",
+    "microsoft.directory/oauth2permissiongrants/",
+    "microsoft.directory/rolemanagement/",
+    "microsoft.directory/groups/members/update",
+)
 
 
 @check("sub-network-topology")
@@ -5021,8 +5098,10 @@ def c_private(ctx):
         return
     note("sub-private-endpoints", len(rows))
     for r in rows:
-        pe = r.get("pe") or 0
-        public = str(r.get("publicNet") or "")
+        pe = val(dig(r, "pe"), None)
+        public = str(val(dig(r, "publicNet"), ""))
+        if pe is None:
+            continue
         if not pe and public == "Enabled":
             add("medium", "paas-no-private-endpoint", str(r.get("name")) + " " + str(r.get("type")).split("/")[-1], "privateEndpoints=0 publicNetworkAccess=Enabled", "service reachable over the public endpoint only", r.get("subscriptionId"))
         elif pe:
@@ -5318,8 +5397,9 @@ def c_pwpolicy(ctx):
     if not users:
         return
     expired = [u for u in users if "DisablePasswordExpiration" in str(idx.props(u).get("passwordPolicies") or "")]
-    add("info", "password-expiry-disabled", "tenant", "users=" + str(len(expired)) + " of " + str(len(users)),
-        "no periodic expiry; Microsoft recommends this state when MFA and banned-password protection are enforced")
+    if expired:
+        add("info", "password-expiry-disabled", "tenant", "users=" + str(len(expired)) + " of " + str(len(users)),
+            "no periodic expiry; Microsoft recommends this state when MFA and banned-password protection are enforced")
     if len(expired) < len(users):
         add("info", "password-expiry-enforced", "tenant", "users=" + str(len(users) - len(expired)) + " of " + str(len(users)),
             "periodic expiry is still enforced for these users; Microsoft no longer recommends forced rotation",
@@ -5462,7 +5542,7 @@ def c_storage_lifecycle(ctx):
 
 @check("entra-pim-policy")
 def c_pim_policy(ctx):
-    pols = graph_all("policies/roleManagementPolicies?$filter=scopeId eq '/' and scopeType eq 'DirectoryRole'", limit=5, beta=True)
+    pols = graph_all("policies/roleManagementPolicies?$filter=scopeId eq '/' and scopeType eq 'DirectoryRole'&$expand=rules", limit=5, beta=True)
     if pols is None:
         note("entra-pim-policy", 0, denied=1)
         return
@@ -5470,14 +5550,20 @@ def c_pim_policy(ctx):
     sample("entra-pim-policy", min(len(pols), 10), len(pols), "role management policies")
     if not pols:
         add("info", "pim-policy-none", "tenant", "0 role management policies", "no activation rules configured")
+    without_rules = 0
     for p in pols[:10]:
-        rules = p.get("rules") or []
-        approval = any(tri(dig(rule, "isApprovalRequired")) is True for rule in rules if "approval" in str(dig(rule, "@odata.type")).lower())
+        rules = lst(dig(p, "rules"))
+        if not rules:
+            without_rules += 1
+            continue
+        approval = any(tri(dig(rule, "settings.isApprovalRequired")) is True for rule in rules if "approval" in str(dig(rule, "@odata.type")).lower())
         mfa = any("MultiFactorAuthentication" in [str(x) for x in lst(dig(rule, "enabledRules"))] for rule in rules)
         justification = any("Justification" in [str(x) for x in lst(dig(rule, "enabledRules"))] for rule in rules)
         add("info", "pim-policy", dig(p, "displayName"), "rules=" + str(len(rules)) + " approval=" + str(approval) + " mfaOnActivation=" + str(mfa) + " justification=" + str(justification), "activation requirements for privileged roles")
         if not mfa:
             add("medium", "pim-activation-no-mfa", dig(p, "displayName"), "enabledRules without MultiFactorAuthentication", "a privileged role activates without a second factor")
+    if without_rules:
+        undecided("pim-rules-unread", str(without_rules) + " policies returned no activation rules", "the rules expansion did not return, so activation requirements are unknown")
 
 
 @check("entra-governance")
@@ -5958,7 +6044,7 @@ def c_subnets(ctx):
 def c_abac(ctx):
     q = """AuthorizationResources
 | where type =~ 'microsoft.authorization/roleassignments'
-| where subscriptionId in (""" + subq(ctx["subs"]) + """)
+| where subscriptionId in (""" + subq(ctx["subs"]) + """) or isempty(tostring(subscriptionId))
 | project principalId=tostring(properties.principalId), principalType=tostring(properties.principalType), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope), condition=tostring(properties.condition)"""
     rows = arg_rows(q, ctx["subs"], scoped=False)
     if rows is None:
@@ -6171,7 +6257,7 @@ def c_fwrules(ctx):
         if fqdn:
             targets = [t.strip(' []"\'') for t in fqdn.strip("[]").split(",") if t.strip(' []"\'')]
             wild = [t for t in targets if t.startswith("*.") or t == "*"]
-            broad = [t for t in wild if t.count(".") <= 2]
+            broad = [t for t in wild if wildcard_scope(t) in ("tld", "public-suffix")]
             if broad:
                 add("high", "firewall-fqdn-wildcard-broad", label, "targets=" + ",".join(broad[:3]), "the application rule permits an entire top-level domain space", s)
             elif wild:
@@ -6294,7 +6380,7 @@ def c_law_auth(ctx):
 @check("sub-mg-assignments")
 def c_mg_assign(ctx):
     q = """AuthorizationResources
-| where subscriptionId in (""" + subq(ctx["subs"]) + """)
+| where subscriptionId in (""" + subq(ctx["subs"]) + """) or isempty(tostring(subscriptionId))
 | where tostring(properties.scope) startswith '/providers/Microsoft.Management'
 | project principalId=tostring(properties.principalId), principalType=tostring(properties.principalType), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope)"""
     rows = arg_rows(q, ctx["subs"], scoped=False)
@@ -6303,8 +6389,10 @@ def c_mg_assign(ctx):
         return
     note("sub-mg-assignments", len(rows))
     for r in rows:
-        sev = "high" if str(r.get("roleId") or "").endswith(BUILTIN_ROLE_OWNER) or str(r.get("roleId") or "").endswith(BUILTIN_ROLE_UAA) else "medium"
-        add(sev, "management-group-assignment", r.get("principalId"), "type=" + str(r.get("principalType")) + " scope=" + str(r.get("scope")), "inherited by every subscription below the group")
+        scope = str(dig(r, "scope"))
+        role = str(dig(r, "roleId"))
+        sev = "high" if role.endswith(BUILTIN_ROLE_OWNER) or role.endswith(BUILTIN_ROLE_UAA) else "medium"
+        add(sev, "management-group-assignment", r.get("principalId"), "type=" + str(r.get("principalType")) + " scope=" + scope, "inherited by every subscription below the group", "tenant", scope)
 
 
 @check("sub-locks-detail")
@@ -6529,7 +6617,11 @@ def c_sentinel_depth(ctx):
         per[str(val(dig(r, "subscriptionId"), ""))][kind] += count
     for k, v in kinds.items():
         add("info", "sentinel-content", k, "count=" + str(v), "detection content inventory")
-    for s, counts in per.items():
+    for s in ctx["subs"]:
+        counts = per.get(s, Counter())
+        if not counts:
+            add("info", "sentinel-absent", s, "0 sentinel resources", "no Microsoft Sentinel content in this subscription", s)
+            continue
         for expected in ("alertrules", "dataconnectors", "automationrules"):
             if not counts.get(expected):
                 add("medium", "sentinel-missing-content", expected, "0 configured subscription=" + s, "no " + expected + " in this subscription", s)
@@ -6817,7 +6909,7 @@ def c_kv_pe(ctx):
     if vaults is None:
         note("sub-kv-pe-state", 0, denied=1)
         return
-    with_pe = [v for v in vaults if lst(dig(v, "properties.privateEndpointConnections"))]
+    with_pe = [v for v in vaults if val(dig(v, "pe"), 0)]
     pend = arg_rows("Resources | where type =~ 'microsoft.keyvault/vaults/privateendpointconnections' | project name, subscriptionId, state=tostring(properties.privateLinkServiceConnectionState.status)", ctx["subs"])
     if pend is None:
         note("sub-kv-pe-state", len(vaults), denied=1)
@@ -6869,7 +6961,7 @@ def c_mfa_baseline(ctx):
         holes = len(lst(dig(users, "excludeUsers"))) + len(lst(dig(users, "excludeGroups"))) + len(lst(dig(users, "excludeRoles"))) + len(lst(dig(apps, "excludeApplications")))
         if all_users and all_apps and (("mfa" in controls) or strength_ok):
             covers_all.append(str(dig(p, "displayName")) + ("(exclusions=" + str(holes) + ")" if holes else ""))
-        elif all_users and all_apps and "mfa" not in controls and (dig(gc, "authenticationStrength") is MISSING or (sid and (entry is None or entry is MISSING))):
+        elif all_users and all_apps and ((not controls and not sid) or (sid and (entry is None or entry is MISSING))):
             unclassified.append(str(dig(p, "displayName")))
     if covers_all:
         add("info", "mfa-all-users-covered", "tenant", "policies=" + ",".join([str(x) for x in covers_all]), "an enforced policy requires MFA for all users and apps; any exclusion shown in brackets is a bypass")
@@ -7293,10 +7385,13 @@ def c_sql_outbound(ctx):
     note("sub-sql-outbound", len(rows))
     for r in rows:
         s = r.get("subscriptionId")
-        if str(r.get("outbound") or "").lower() in ("enabled", "true"):
+        outbound = str(val(dig(r, "outbound"), "")).lower()
+        if outbound in ("enabled", "true"):
             add("info", "sql-outbound-restricted", r.get("name"), "restrictOutboundNetworkAccess=Enabled", "server egress is limited to the outbound firewall list", s)
+        elif not outbound:
+            add("low", "sql-outbound-unknown", dig(r, "name"), "restrictOutboundNetworkAccess not returned", "server egress cannot be confirmed", s)
         else:
-            add("low", "sql-outbound-open", r.get("name"), "restrictOutboundNetworkAccess not Enabled", "server can reach arbitrary endpoints; usable for exfiltration", s)
+            add("low", "sql-outbound-open", r.get("name"), "restrictOutboundNetworkAccess=" + outbound, "server can reach arbitrary endpoints; usable for exfiltration", s)
 
 
 @check("sub-net-routes")
@@ -7308,8 +7403,12 @@ def c_routes(ctx):
     note("sub-net-routes", len(rows))
     for r in rows:
         hop = str(r.get("hop") or "")
-        if hop in ("Internet", "None"):
+        if hop.lower() == "internet":
             add("medium", "route-default-to-internet", r.get("name"), "route=" + str(r.get("route")) + " nextHop=" + hop, "all egress bypasses inspection", r.get("subscriptionId"))
+        elif hop.lower() == "none":
+            add("info", "route-default-dropped", dig(r, "name"), "route=" + str(dig(r, "route")) + " nextHop=None", "the default route discards the traffic", dig(r, "subscriptionId"))
+        elif not hop:
+            add("low", "route-default-unreadable", dig(r, "name"), "nextHopType not returned", "the default route target cannot be confirmed", dig(r, "subscriptionId"))
         else:
             add("info", "route-default-captured", r.get("name"), "route=" + str(r.get("route")) + " nextHop=" + hop, "default route is captured by an appliance", dig(r, "subscriptionId"))
 
@@ -7538,8 +7637,11 @@ def c_backup_vault(ctx):
             add("medium", "backup-vault-softdelete-off", dig(r, "name"), "softDeleteState=" + str(dig(soft, "softDeleteState")), "deleted backups cannot be recovered", s)
         elif sd_state == "unknown":
             add("low", "backup-vault-softdelete-unknown", r.get("name"), "softDeleteState not returned", "recovery capability cannot be confirmed", s)
-        if on_off(soft.get("enhancedSecurityState")) != "on":
-            add("low", "backup-vault-mua-off", dig(r, "name"), "enhancedSecurityState=" + str(dig(soft, "enhancedSecurityState")), "multi-user authorisation not enforced", s)
+        mua = on_off(sec.get("multiUserAuthorization"))
+        if mua == "off":
+            add("low", "backup-vault-mua-off", dig(r, "name"), "multiUserAuthorization=Disabled", "multi-user authorisation not enforced", s)
+        elif mua == "unknown":
+            add("low", "backup-vault-mua-unknown", dig(r, "name"), "multiUserAuthorization not returned", "multi-user authorisation cannot be confirmed", s)
         if str(red.get("standardTierStorageRedundancy") or "").lower() in ("locallyredundant", "lrs"):
             add("low", "backup-vault-lrs", r.get("name"), "standardTierStorageRedundancy=LRS", "vault is not resilient to a region failure", s)
 
@@ -7557,8 +7659,14 @@ def c_aks_kv(ctx):
         kv = tri(r.get("kv"))
         if kv is False:
             add("info", "aks-no-kv-provider", r.get("name"), "azureKeyvaultSecretsProvider=disabled", "secrets are stored in cluster objects, not Key Vault", s)
-        elif tri(r.get("csi")) is not True:
-            add("low", "aks-kv-secret-rotation-off", r.get("name"), "enableSecretRotation not true", "rotated vault secrets are not refreshed in the pod", s)
+        elif kv is None:
+            add("low", "aks-kv-provider-unknown", dig(r, "name"), "azureKeyvaultSecretsProvider not returned", "the Key Vault add-on state cannot be confirmed", s)
+        else:
+            rotation = tri(r.get("csi"))
+            if rotation is False:
+                add("low", "aks-kv-secret-rotation-off", r.get("name"), "enableSecretRotation=false", "rotated vault secrets are not refreshed in the pod", s)
+            elif rotation is None:
+                add("low", "aks-kv-secret-rotation-unknown", dig(r, "name"), "enableSecretRotation not returned", "secret rotation cannot be confirmed", s)
         kubelet = str(val(dig(r, "kubelet"), ""))
         if not kubelet:
             add("medium", "aks-no-kubelet-identity", dig(r, "name"), "identityProfile.kubeletidentity.objectId not returned", "kubelet has no dedicated managed identity to scope the node resource group", s)
@@ -7659,7 +7767,7 @@ def c_waf_attach(ctx):
 
 @check("sub-pim-azure-approval")
 def c_pim_azure(ctx):
-    rows = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleeligibilityschedules' | project name, subscriptionId, scope=tostring(properties.scope), principalId=tostring(properties.principalId), roleId=tostring(properties.roleDefinitionId)", ctx["subs"])
+    rows = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleeligibilityschedules' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project name, subscriptionId, scope=tostring(properties.scope), principalId=tostring(properties.principalId), roleId=tostring(properties.roleDefinitionId)", ctx["subs"], scoped=False)
     if rows is None:
         note("sub-pim-azure-approval", 0, denied=1)
         return
@@ -7732,8 +7840,11 @@ def c_legacy_block(ctx):
         controls = [str(c).lower() for c in lst(dig(p, "grantControls.builtInControls"))]
         users = dig(p, "conditions.users")
         excludes = lst(dig(users, "excludeUsers")) + lst(dig(users, "excludeGroups")) + lst(dig(users, "excludeRoles"))
-        if ("other" in ctypes or "exchangeactivesync" in ctypes or "all" in ctypes) and "block" in controls:
+        legacy = {"other", "exchangeactivesync", "all"} & set(ctypes)
+        if legacy and "block" in controls and "All" in lst(dig(users, "includeUsers")):
             blocks.append(str(dig(p, "displayName")) + ("(exclusions=" + str(len(excludes)) + ")" if excludes else ""))
+        elif legacy and "block" in controls:
+            add("info", "legacy-block-narrow", str(dig(p, "displayName")), "clientAppTypes=" + ",".join(sorted(legacy)), "a legacy Block policy applies to a named population only, so legacy clients outside it still authenticate")
     if not ca_complete():
         capped("entra-legacy-auth-block", len(pols), "conditional access policy pages")
         return
@@ -8262,10 +8373,11 @@ def c_b2x(ctx):
     note("entra-b2x-userflows", len(rows))
     for f in rows:
         name = str(dig(f, "displayName"))
-        for side in ("apiConnectorConfiguration.postFederationSignup.identityProvider", "apiConnectorConfiguration.postAttributeCollection.identityProvider"):
+        for side in ("apiConnectorConfiguration.postFederationSignup", "apiConnectorConfiguration.postAttributeCollection"):
             connector = dig(f, side)
-            if connector:
-                add("medium", "b2x-api-connector", name, "connector=" + str(dig(connector, "displayName")), "an external API connector runs during sign-up and holds its own credential")
+            if isinstance(connector, dict) and connector:
+                label = str(val(dig(connector, "displayName"), dig(connector, "id")))
+                add("medium", "b2x-api-connector", name, "connector=" + label, "an external API connector runs during sign-up and holds its own credential")
 
 
 @check("entra-consent-workflow-depth")
@@ -8370,7 +8482,7 @@ def c_group_members(ctx):
 
 @check("sub-appinsights-keys")
 def c_appinsights(ctx):
-    rows = arg_rows("Resources | where type =~ 'microsoft.insights/components' | project name, subscriptionId, publicIngest=tostring(properties.publicNetworkAccessForIngestion), publicQuery=tostring(properties.publicNetworkAccessForQuery), localAuth=tostring(properties.DisableLocalAuth), retention=tostring(properties.retentionInDays)", ctx["subs"])
+    rows = arg_rows("Resources | where type =~ 'microsoft.insights/components' | project name, subscriptionId, publicIngest=tostring(properties.publicNetworkAccessForIngestion), publicQuery=tostring(properties.publicNetworkAccessForQuery), localAuth=tostring(properties.DisableLocalAuth), retention=tostring(properties.RetentionInDays)", ctx["subs"])
     if rows is None:
         note("sub-appinsights-keys", 0, denied=1)
         return
@@ -8416,7 +8528,7 @@ def c_adf(ctx):
 def c_dcr(ctx):
     q = (
         "Resources | where type =~ 'microsoft.insights/datacollectionrules'"
-        " | project name, subscriptionId, ident=tostring(identity.type), sources=properties.dataSources"
+        " | project name, subscriptionId, ident=tostring(identity.type), syslog=array_length(properties.dataSources.syslog)"
     )
     rows = arg_rows(q, ctx["subs"])
     if rows is None:
@@ -8427,10 +8539,9 @@ def c_dcr(ctx):
         name = str(dig(r, "name"))
         if not dig(r, "ident"):
             add("low", "dcr-no-identity", name, "identity.type=none", "the rule writes to a workspace without its own identity", str(dig(r, "subscriptionId")))
-        sources = dig(r, "sources")
-        kinds = [str(dig(s, "kind")).lower() for s in sources] if isinstance(sources, list) else []
-        if "syslog" in kinds:
-            add("info", "dcr-syslog", name, "syslogDataSources=" + str(kinds.count("syslog")), "syslog collection widens the log injection surface", str(dig(r, "subscriptionId")))
+        syslog = val(dig(r, "syslog"), None)
+        if isinstance(syslog, int) and syslog > 0:
+            add("info", "dcr-syslog", name, "syslogDataSources=" + str(syslog), "syslog collection widens the log injection surface", str(dig(r, "subscriptionId")))
 
 
 @check("sub-security-settings")
@@ -8457,14 +8568,14 @@ def c_security_settings(ctx):
 
 @check("sub-policy-dine-identity")
 def c_dine(ctx):
-    rows = arg_rows("PolicyResources | where type =~ 'microsoft.authorization/policyassignments' | where tostring(identity.type) == 'SystemAssigned' | project name, subscriptionId, scope=tostring(properties.scope), def=tostring(properties.policyDefinitionId)", ctx["subs"])
+    rows = arg_rows("PolicyResources | where type =~ 'microsoft.authorization/policyassignments' | where tostring(identity.type) == 'SystemAssigned' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project name, subscriptionId, scope=tostring(properties.scope), def=tostring(properties.policyDefinitionId)", ctx["subs"], scoped=False)
     if rows is None:
         note("sub-policy-dine-identity", 0, denied=1)
         return
     note("sub-policy-dine-identity", len(rows))
     if not rows:
         return
-    assignments = unread(arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where tostring(properties.principalType) == 'ServicePrincipal' | project principalId=tostring(properties.principalId), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope)", ctx["subs"]),
+    assignments = unread(arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where tostring(properties.principalType) == 'ServicePrincipal' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project principalId=tostring(properties.principalId), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope)", ctx["subs"], scoped=False),
                          "role assignments held by service principals", "dine-identity-assignments-unreadable")
     if assignments is None:
         return
@@ -8721,10 +8832,12 @@ def c_consent_policy(ctx):
         if authz is None:
             denied_now("entra-consent-grant-policy")
             add("low", "consent-policy-unreadable", "tenant", "0 grant policies and authorizationPolicy unreadable", "user consent restriction cannot be assessed")
-        elif not default or "managepermissiongrants" in default.lower():
+        elif consent_breadth(default) == "broad":
             add("high", "no-consent-grant-policy", "tenant", "grantPolicies=0 defaultUserRolePermissions=" + (default or "unset"), "users can consent to any application permission")
-        else:
+        elif consent_breadth(default) == "restricted":
             add("info", "consent-restricted-by-default", "tenant", "defaultUserRolePermissions.permissionGrantPoliciesAssigned=" + default, "the built-in default restricts user consent")
+        else:
+            undecided("consent-policy-unresolved", "grantPolicies=0 assigned=" + default[:80], "the assigned grant policy was not read, so the consent breadth is unknown")
         return
     for p in rows:
         rules = lst(dig(p, "includes"))
@@ -8876,7 +8989,7 @@ def c_fw_premium(ctx):
 
 @check("sub-frontdoor")
 def c_frontdoor(ctx):
-    rows = arg_rows("Resources | where type in~ ('microsoft.cdn/profiles/afdendpoints/routes','microsoft.cdn/profiles/endpoints') | project name, type, subscriptionId, redirect=tostring(properties.forwardingProtocol), httpsRedirect=tostring(properties.httpsRedirect), linkToDefaultDomain=tostring(properties.linkToDefaultDomain)", ctx["subs"])
+    rows = arg_rows("Resources | where type in~ ('microsoft.cdn/profiles/afdendpoints/routes','microsoft.cdn/profiles/endpoints') | project name, type, subscriptionId, redirect=tostring(properties.forwardingProtocol), httpsRedirect=tostring(properties.httpsRedirect), httpAllowed=tostring(properties.isHttpAllowed), linkToDefaultDomain=tostring(properties.linkToDefaultDomain)", ctx["subs"])
     if rows is None:
         note("sub-frontdoor", 0, denied=1)
         return
@@ -8886,6 +8999,10 @@ def c_frontdoor(ctx):
     for r in rows:
         s = str(dig(r, "subscriptionId"))
         name = str(dig(r, "name"))
+        if str(val(dig(r, "type"), "")).lower().endswith("/endpoints"):
+            if tri(dig(r, "httpAllowed")) is True:
+                add("medium", "frontdoor-http-allowed", name, "isHttpAllowed=true", "the classic CDN endpoint accepts plaintext requests", s)
+            continue
         redirect = str(val(dig(r, "redirect"), "")).lower()
         https_redirect = tri(dig(r, "httpsRedirect"))
         if redirect and redirect not in ("httpsonly", "matchrequest") and https_redirect is not True:
@@ -9077,8 +9194,9 @@ def c_sspr(ctx):
         note("entra-sspr", 1, denied=1)
         add("info", "sspr-unassessed", "tenant", "authenticationMethodsPolicy unreadable", "reset methods were not assessed")
         return
-    methods = [str(dig(c, "id")) for c in lst(dig(pol, "authenticationMethodConfigurations")) if str(dig(c, "state")).lower() == "enabled"]
-    reset_methods = [m for m in methods if m in ("Email", "MobilePhone", "SecurityQuestion", "MicrosoftAuthenticator", "SoftwareOath")]
+    methods = [str(dig(c, "id")) for c in lst(dig(pol, "authenticationMethodConfigurations"))
+               if str(dig(c, "state")).lower() == "enabled" or tri(dig(c, "selfServicePasswordResetEnabled")) is True]
+    reset_methods = [m for m in methods if m in ("Email", "Sms", "Voice", "MicrosoftAuthenticator", "SoftwareOath")]
     if not reset_methods:
         add("medium", "sspr-no-method", "tenant", "enabledMethods=" + ",".join(methods)[:80], "self-service password reset has no usable verification method")
     elif len(reset_methods) < 2:
@@ -9482,16 +9600,14 @@ def c_pim_activation(ctx):
     for p in pols[:10]:
         rules = lst(dig(p, "rules"))
         enabled = set()
-        ticketing = False
         max_duration = ""
         for rule in rules:
             for item in lst(dig(rule, "enabledRules")):
                 enabled.add(str(item))
             rtype = str(dig(rule, "@odata.type")).lower()
-            if rtype.endswith("ticketingrule"):
-                ticketing = bool(dig(rule, "ticketSystem"))
             if rtype.endswith("expirationrule") or rtype.endswith("expirationendrule"):
                 max_duration = str(val(dig(rule, "maximumDuration"), ""))
+        ticketing = "Ticketing" in enabled
         name = str(val(dig(p, "displayName"), dig(p, "id")))
         if "Justification" not in enabled:
             add("medium", "pim-no-justification", name, "enabledRules=" + ",".join(sorted(enabled))[:80], "activation records no reason")
@@ -10304,7 +10420,7 @@ def c_overscope(ctx):
     sp_app = {}
     declared = dict(by_app)
     for s in lst(sps):
-        label, wanted = by_app.get(str(dig(s, "appId")), (str(val(dig(s, "displayName"), "")), {}))
+        label, wanted = by_app.get(str(dig(s, "appId")), (str(val(dig(s, "displayName"), "")), None))
         sid = str(dig(s, "id"))
         sp_app[sid] = str(val(dig(s, "appId"), ""))
         declared[sid] = (label, wanted)
@@ -10320,6 +10436,9 @@ def c_overscope(ctx):
         resource_app = sp_app.get(resource)
         if not resource_app:
             add("low", "grant-resource-unresolved", name, "resourceId=" + resource, "the granted resource is not in the service principals read, so the grant was not compared with a manifest")
+            continue
+        if wanted is None:
+            add("low", "grant-manifest-unreadable", name, "granted=" + ",".join(sorted(granted)[:4]) + " resource=" + resource_app, "the client is a service principal with no application object in this directory, so its manifest was not read")
             continue
         wanted_ids = set(wanted.get(resource_app, set()))
         if granted and not wanted_ids:
@@ -10382,7 +10501,9 @@ def c_aks_exposure(ctx):
         name = str(dig(r, "name"))
         private = tri(dig(r, "privateCluster"))
         ranges = lst(dig(r, "ranges"))
-        if private is not True and not ranges:
+        if private is None:
+            add("low", "aks-api-state-unknown", name, "enablePrivateCluster not returned", "the API server exposure cannot be confirmed", s)
+        elif private is not True and not ranges:
             add("medium", "aks-api-public-unrestricted", name, "privateCluster=false authorizedIpRanges=0", "the Kubernetes API server accepts connections from any address", s)
         elif private is not True:
             add("low", "aks-api-public-restricted", name, "authorizedIpRanges=" + str(len(ranges)), "the API server is public but limited to listed ranges", s)
@@ -10441,20 +10562,26 @@ def c_breakglass_hardening(ctx):
     if defs is None or asg is None:
         note("entra-breakglass-hardening", 0, denied=1)
         return
-    ga = {str(dig(d, "id")) for d in defs if str(val(dig(d, "templateId"), "")).lower() == "62e90394-69f5-4237-9190-012177145e10"}
+    ga = {str(dig(d, "id")) for d in defs if str(val(dig(d, "templateId"), "")).lower() == GA_TEMPLATE}
     holders = [str(dig(a, "principalId")) for a in asg if str(dig(a, "roleDefinitionId")) in ga]
     note("entra-breakglass-hardening", min(len(holders), 10))
     sample("entra-breakglass-hardening", min(len(holders), 10), len(holders), "global administrator holders read")
-    exclude_counts = Counter()
+    excluded_users = defaultdict(set)
+    excluded_groups = defaultdict(set)
+    excluded_roles = defaultdict(set)
     enabled_policies = 0
     excluded_known = pols is not None
     if not excluded_known:
         undecided("breakglass-exclusion-unread", "conditional access policies unread", "whether the emergency accounts are excluded from enforced policies was not decided")
-    for p in lst(pols):
+    for index, p in enumerate(lst(pols)):
         if str(dig(p, "state")) == "enabled":
             enabled_policies += 1
             for uid in lst(dig(p, "conditions.users.excludeUsers")):
-                exclude_counts[str(uid)] += 1
+                excluded_users[str(uid)].add(index)
+            for gid in lst(dig(p, "conditions.users.excludeGroups")):
+                excluded_groups[str(gid)].add(index)
+            for rid in lst(dig(p, "conditions.users.excludeRoles")):
+                excluded_roles[str(rid).lower()].add(index)
     evaluated = 0
     for pid in holders[:10]:
         doc = graph("users/" + pid + "?$select=displayName,userPrincipalName,accountEnabled,onPremisesImmutableId,assignedLicenses")
@@ -10464,8 +10591,19 @@ def c_breakglass_hardening(ctx):
         evaluated += 1
         name = str(val(dig(doc, "userPrincipalName"), pid))
         label = str(val(dig(doc, "displayName"), pid))
-        excluded_by = exclude_counts.get(pid, 0)
-        if excluded_known:
+        groups = graph("users/" + pid + "/transitiveMemberOf?$select=id")
+        group_hits = None
+        if groups is None:
+            denied_now("entra-breakglass-hardening")
+        else:
+            group_hits = set()
+            for g in lst(dig(groups, "value")):
+                group_hits |= excluded_groups.get(str(dig(g, "id")), set())
+        hits = set(excluded_users.get(pid, set())) | set(excluded_roles.get(GA_TEMPLATE, set()))
+        if group_hits is not None:
+            hits |= group_hits
+        excluded_by = len(hits)
+        if excluded_known and group_hits is not None:
             if not enabled_policies:
                 add("info", "breakglass-exclusion-not-applicable", name, "enabledPolicies=0", "no enforced policy exists, so an emergency exclusion cannot be configured")
             elif excluded_by and excluded_by == enabled_policies:
