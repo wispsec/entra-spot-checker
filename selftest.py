@@ -238,6 +238,27 @@ def regressions():
     ev = [f["evidence"] for f in M.FINDINGS if f["check"] == "dynamic-group-holds-role"]
     assert any("viaNestedGroup" in e for e in ev), ev
     reset()
+    # One row per privileged group: who can join it, and what membership gives.
+    pctx = {"dyn_rules": {"g1": ("DG", 'user.department -eq "IT"', "On")},
+            "steer_writer": {"g1": "user a@x -> owns App -> writes user.extension_x"},
+            "caps": {"g1": [(3, "Owner on /subscriptions/s1")]},
+            "caps_blind": set(),
+            "group_roles": {"g1": {"name": "Global Administrator", "writable": True}}}
+    rows = M.privileged_groups(pctx)
+    assert len(rows) == 1, rows
+    name, entry, grants, status = rows[0]
+    assert name == "DG" and "owns App" in entry, rows
+    assert "Global Administrator" in grants and "Owner on" in grants, rows
+    assert status == "ok", rows
+    # A failed capability read is unassessed, never "grants nothing".
+    pctx["caps"] = {}
+    pctx["caps_blind"] = {"g1"}
+    rows = M.privileged_groups(pctx)
+    assert rows and rows[0][3] == "unassessed" and rows[0][2] == "Global Administrator", rows
+    # No role and no grant is not a row at all.
+    pctx["group_roles"] = {}
+    pctx["caps_blind"] = set()
+    assert M.privileged_groups(pctx) == [], M.privileged_groups(pctx)
     # A property the API did not return is unknown, never off.
     rows = [{"name": "v", "subscriptionId": subs[0], "soft": "Enabled", "enhanced": "", "immut": ""}]
     got = _run("sub-backup-rsv-posture", {"subs": subs}, arg_rows=lambda *a, **k: rows)

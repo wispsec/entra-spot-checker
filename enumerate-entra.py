@@ -3126,6 +3126,8 @@ def c_dyn(ctx):
         ctx["dyn"][gid] = steer
         ctx["dynamic"].add(gid)
     caps, blind = _group_capabilities(ctx, [g for g, (s, _a) in steers.items() if s != "fixed"])
+    ctx["caps"] = caps
+    ctx["caps_blind"] = blind
     for gid, (name, rule, state) in groups.items():
         label = name or gid
         steer, attrs = steers[gid]
@@ -3292,6 +3294,7 @@ def c_grouproles(ctx):
     role_of = {}
     for a in assignments:
         role_of.setdefault(str(dig(a, "principalId")), defs.get(str(dig(a, "roleDefinitionId"))) or {})
+    ctx["group_roles"] = role_of
     segment_of = dig(ctx, "steer_writer", {})
     for a in assignments:
         pid = a.get("principalId")
@@ -10425,6 +10428,38 @@ def c_tags(ctx):
         add("info", "tag-coverage", "all", "resources=" + str(len(rows)) + " withoutOwner=0", "every resource records an owner")
 
 
+def privileged_groups(ctx):
+    """Rows for the groups that hold a role or a grant: who can join, and what it gives.
+
+    One row per dynamic group. A group whose capability read failed is marked
+    unassessed and its grant column says so; an empty grant column would read as
+    "grants nothing".
+    """
+    groups = ctx["dyn_rules"] if ctx.get("dyn_rules") else {}
+    caps = ctx["caps"] if ctx.get("caps") else {}
+    blind = ctx["caps_blind"] if ctx.get("caps_blind") else set()
+    roles = ctx["group_roles"] if "group_roles" in ctx else None
+    rows = []
+    for gid, (name, rule, _state) in groups.items():
+        grants = []
+        role = roles[gid] if roles is not None and gid in roles else {}
+        label = str(val(dig(role, "name"), ""))
+        if label:
+            grants.append(label)
+        for _rank, cap in caps[gid] if gid in caps else []:
+            grants.append(str(cap))
+        if not grants and gid not in blind:
+            continue
+        steer, _attrs = rule_steer(rule)
+        entry = ctx["steer_writer"][gid] if "steer_writer" in ctx and gid in ctx["steer_writer"] else ""
+        if not entry:
+            entry = STEER_LABEL[steer] if steer in STEER_LABEL else ("static rule: " + rule[:60] if rule else "no rule")
+        status = "unassessed" if gid in blind or roles is None else "ok"
+        rows.append((name or gid, entry, ", ".join(grants) or "not read", status))
+    rows.sort(key=lambda row: (row[3] != "ok", row[0]))
+    return rows
+
+
 def run(subs, idx, opts):
     ctx = {"subs": subs, "idx": idx, "dynamic": set(), "guests": set(), "dyn_done": False,
            "guests_done": False, "include_vms": bool(opts.get("include_vms")), "selected": opts["checks"]}
@@ -10907,6 +10942,10 @@ def lint(path=None):
     for i in sorted(emitted):
         if i not in FRAMEWORK and _infer(i) == "MISC-":
             failures.append("finding id has no register tag: " + i + " (add a FRAMEWORK row)")
+    for found in re.finditer(r"properties\.[a-z0-9_]+-[a-z0-9-]+", source, re.IGNORECASE):
+        failures.append("hyphenated query key at line %d: %s; a dotted KQL path cannot carry a hyphen, use properties['%s']"
+                        % (source[:found.start()].count("\n") + 1, found.group(0), found.group(0).split(".", 1)[1]))
+
     for finding_id, severities in sorted(static.items()):
         if len(severities) > 1:
             failures.append("finding id carries several severities: " + finding_id + " (" + ", ".join(sorted(severities)) + "); one id is one misconfiguration at one severity")
@@ -11056,7 +11095,7 @@ def main():
         print("azurehound: " + idx.state + " (" + idx.detail + "); identity checks report absent")
 
     selected = set(x.strip() for x in args.check.split(",") if x.strip())
-    run(subs, idx, {"checks": selected, "no_az": args.no_az, "no_entra": args.no_entra,
+    ctx = run(subs, idx, {"checks": selected, "no_az": args.no_az, "no_entra": args.no_entra,
                     "no_subs": args.no_subs, "include_vms": args.include_vms})
     report_dataset_gaps()
 
@@ -11168,6 +11207,19 @@ def main():
         for row in chain_rows:
             c = row["chain"]
             print(row["id"] + " " + c["severity"] + " " + c["chain"] + " [" + str(c["source"]) + "]: " + c["path"])
+
+    rows = privileged_groups(ctx)
+    print("\n=== privileged groups ===")
+    if rows:
+        print("%-28s %-44s %-34s %s" % ("GROUP", "ENTRY", "GRANTS", "STATUS"))
+        for name, entry, grants, status in rows[:25]:
+            print("%-28s %-44s %-34s %s" % (str(name)[:28], str(entry)[:44], str(grants)[:34], status))
+        if len(rows) > 25:
+            print("sampled: 25 of " + str(len(rows)) + " groups")
+    elif ctx.get("dyn_rules") is None:
+        print("unassessed: the dynamic group list was not read")
+    else:
+        print("empty: no dynamic group holds a role or a grant")
 
     print("\n=== findings ===")
     print("%-9s %3s %-14s %-32s %-32s %s" % ("SEV", "SCR", "SUBSCRIPTION", "CHECK", "SUBJECT", "EVIDENCE"))

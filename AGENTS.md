@@ -128,7 +128,7 @@ attribution behind.
 
 ## Lint gates
 
-`--lint` runs six gates and exits 1 on any failure.
+`--lint` runs seven gates and exits 1 on any failure.
 
 | Gate | Rejects |
 |---|---|
@@ -138,6 +138,7 @@ attribution behind.
 | Scope declaration | A `scoped=False` query with no `subscriptionId` predicate, not wrapped in `tenant_wide()` or `filtered_in_python()`. |
 | Finding identity | Two spellings of one id, an id with no register tag. |
 | Finding severity | One id at two static severities: the same id must mean one misconfiguration at one severity. |
+| Query keys | A dotted KQL path that carries a hyphen, such as `properties.x.aad-enabled`. The parser reads it as subtraction, and the whole query is rejected. |
 
 A gate failure is a code defect, not a baseline problem. Fix the code.
 
