@@ -28,19 +28,17 @@ VM_ATTACHED = ("/networkInterfaces/", "/virtualMachines/", "/virtualMachineScale
 BUILTIN_ROLE_OWNER = "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
 BUILTIN_ROLE_UAA = "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9"
 GRAPH_APP_ID = "00000003-0000-0000-c000-000000000000"
+# Application permissions that reach directory role control in one step.
+GRAPH_TIER0 = ("RoleManagement.ReadWrite.Directory", "AppRoleAssignment.ReadWrite.All", "Application.ReadWrite.All")
+GRAPH_DANGEROUS = GRAPH_TIER0 + ("Directory.ReadWrite.All", "User.ReadWrite.All", "Group.ReadWrite.All",
+                                 "Sites.FullControl.All", "Mail.ReadWrite")
 MS_TENANTS = ("72f988bf-86f1-41af-91ab-2d7cd011db47", "f8cdef31-a31e-4b4a-93e4-5f571e91255a",
                "cdc5aeea-15c5-4db6-b079-fcadd2505dc2", "33e01921-4d64-4f8c-a055-5bdaffd5e33d")
-HIGH_VALUE_RESOURCES = {
-    "00000003-0000-0000-c000-000000000000",
-    "00000002-0000-0ff1-ce00-000000000000",
-    "00000003-0000-0ff1-ce00-000000000000",
-    "797f4846-ba00-4fd7-ba43-dac1f8f63013",
-}
-LOW_PRIVILEGE_APP_ROLES = {
-    "e1fe6dd8-ba31-4d61-89e7-88639da4683d",
-    "14dad69e-099b-42c9-810b-d002981feec1",
-    "5b567255-7703-4780-807c-7be8301ae99b",
-    "37f7f235-527c-4136-accd-4a02d197296e",
+# Application permissions, per resource app, that an owner can hijack by adding a credential.
+TAKEOVER_ROLES = {
+    GRAPH_APP_ID: ("", GRAPH_DANGEROUS),
+    "00000002-0000-0ff1-ce00-000000000000": ("Exchange:", ("full_access_as_app", "Exchange.ManageAsApp")),
+    "00000003-0000-0ff1-ce00-000000000000": ("SharePoint:", ("Sites.FullControl.All",)),
 }
 HOME_TENANT = {"id": "", "name": ""}
 TENANT_NAMES = {}
@@ -371,7 +369,8 @@ def az(args, timeout=150, retries=3):
 
 
 def az_kind():
-    return LAST_ERROR.get("kind") or "error"
+    """Kind of the last transport failure, or "" when the last call succeeded."""
+    return LAST_ERROR.get("kind") or ""
 
 
 def own(name):
@@ -412,7 +411,7 @@ def mark_failure():
     if not chk or CURRENT.get("suppress") or LAST_ERROR.get("booked") == chk:
         return
     LAST_ERROR["booked"] = chk
-    kind = az_kind()
+    kind = az_kind() or "error"
     CHECK_ERR[chk] = (kind, LAST_ERROR.get("detail", "")[:120])
     c = COVERAGE.setdefault(chk, {"examined": 0, "denied": 0, "status": "ok"})
     if kind in ("error", "unavailable", "unauthenticated"):
@@ -453,6 +452,11 @@ def ca_all(kind="policies", limit=5):
         CA_CACHE[kind] = first
         return first
     return None
+
+
+def ca_complete():
+    """True when the cached policy list was read without hitting a page cap."""
+    return not any(p in TRUNCATED for p in CA_PATH_POLICIES)
 
 
 def graph(path, beta=False):
@@ -905,7 +909,7 @@ def note(check, examined, denied=0):
         elif kind == "throttled":
             c["status"] = "throttled"
             c["detail"] = "rate limited; area not assessed"
-        elif kind == "absent":
+        elif kind == "absent" and not c["examined"]:
             c["status"] = "absent"
         else:
             DENIED[check] = max(DENIED[check], denied)
@@ -993,6 +997,16 @@ def on_off(value):
     return "unknown"
 
 
+def immutability(value):
+    """Vault immutability: on when Locked, off when Disabled or Unlocked, unknown otherwise."""
+    text = str(val(value, "")).strip().lower()
+    if text == "locked":
+        return "on"
+    if text in ("disabled", "unlocked"):
+        return "off"
+    return "unknown"
+
+
 def sample(check, shown, total, what="records"):
     """Record a deliberate sample: the area is assessed, the listed remainder is not."""
     if total and shown < total:
@@ -1026,6 +1040,8 @@ FRAMEWORK = {
     "subscription-owner-group": ("CWE-269", "ID-"),
     "subscription-owner-serviceprincipal": ("CWE-269", "ID-"),
     "subscription-owner-count": ("CWE-269", "ID-"),
+    "implicit-access-token": ("CWE-522", "APP-"),
+    "implicit-id-token": ("CWE-522", "APP-"),
     "management-group-owner": ("CWE-269", "ID-"),
     "azure-lighthouse-delegation": ("CWE-284", "ID-"),
     "classic-coadministrator": ("CWE-269", "ID-"),
@@ -1061,7 +1077,7 @@ FRAMEWORK = {
     "orphaned-arm-role-assignment": ("CWE-672", "ID-"),
     "orphaned-app-role-assignment": ("CWE-672", "ID-"),
     "backup-soft-delete-off": ("CWE-693", "GOV-"),
-    "dynamic-group-writable-attribute": ("CWE-1188", "ID-"),
+    "dynamic-group-steerable": ("CWE-269", "ID-"),
     "dynamic-group-holds-role": ("CWE-269", "ID-"),
     "ca-policy-report-only": ("CWE-693", "CA-"),
     "ca-exclusion-dynamic-group": ("CWE-693", "CA-"),
@@ -1073,14 +1089,15 @@ FRAMEWORK = {
     "app-secret-expired": ("CWE-324", "APP-"),
     "app-audience-collision": ("CWE-287", "APP-"),
     "write-consent-grant": ("CWE-441", "APP-"),
-    "privileged-sp-owned-by-human": ("CWE-269", "APP-"),
+    "high-priv-app-owned-by-human": ("CWE-269", "APP-"),
     "shared-device-key": ("CWE-287", "ID-"),
     "subscription-unexamined": ("CWE-1059", "SCOPE-"),
     "azurehound-unreadable": ("CWE-1059", "TOOL-"),
     "azurehound-nodes-skipped": ("CWE-1059", "TOOL-"),
     "grant-scope-names-unresolved": ("CWE-1059", "TOOL-"),
     "controlplane-key-readable": ("CWE-522", "SEC-"),
-    "password-never-expires": ("CWE-287", "AUTH-"),
+    "password-expiry-disabled": ("CWE-287", "AUTH-"),
+    "password-expiry-enforced": ("CWE-287", "AUTH-"),
     "tap-enabled-scope": ("CWE-287", "AUTH-"),
     "principal-can-grant-access": ("CWE-269", "ID-"),
     "privileged-principal-type-unknown": ("CWE-1059", "ID-"),
@@ -1325,8 +1342,28 @@ def add(sev, check, subject, ev, why, subscription=None, scope="tenant", likelih
     FINDINGS.append(record)
 
 
+CHAIN_SEEN = set()
+CHAIN_CAP = 40
+
+
 def chain(name, path, sev, why):
-    CHAINS.append({"chain": name, "path": path, "severity": sev, "why": why})
+    """Record one attack chain, once per name and path.
+
+    The owning check is stored so the report can tie the chain to the findings that
+    justify it. A loop that walks many objects must not repeat one chain, and one
+    name must not grow without bound.
+    """
+    if sev not in SEV:
+        raise ValueError("unknown chain severity: " + str(sev))
+    key = str(name) + "|" + str(path)
+    if key in CHAIN_SEEN:
+        return
+    if sum(1 for c in CHAINS if c["chain"] == name) >= CHAIN_CAP:
+        capped(CURRENT["check"], CHAIN_CAP, "chains for " + str(name))
+        return
+    CHAIN_SEEN.add(key)
+    CHAINS.append({"chain": name, "path": path, "severity": sev, "why": why,
+                   "source": CURRENT["check"]})
 
 
 class DatasetUnavailable(Exception):
@@ -1519,7 +1556,7 @@ DATASET_GAPS = []
 
 TRANSPORT_CALLS = ("graph(", "graph_all(", "arg_rows(", "arg(", "az(", "arm(", "ca_all(", "per_sub(",
                    "scan_guests(", "scan_dynamic(", "_kv_rows(", "_kv_vaults(", "_strengths(", "resolve(",
-                   "denied_now(", "mark_failure(", "DATAPLANE_PROBES", "kv_rows(")
+                   "denied_now(", "mark_failure(", "DATAPLANE_PROBES", "kv_rows(", "_owner_takeover(", "dynamic_groups(")
 OFFLINE_CHECKS = set()
 
 
@@ -2316,7 +2353,7 @@ def c_appservice(ctx):
             add("medium", "appservice-ftp-enabled", r.get("name"), "ftpsState=AllAllowed", "FTP transport enabled", s)
         debug = tri(p.get("remoteDebuggingEnabled"))
         if debug is True:
-            add("medium", "appservice-remote-debug", r.get("name"), "remoteDebuggingEnabled=true", "debug endpoint exposed", s)
+            add("high", "appservice-remote-debug", r.get("name"), "remoteDebuggingEnabled=true", "debug endpoint exposed", s)
         tls = str(p.get("minTlsVersion") or "").strip()
         if tls in ("1.0", "1.1"):
             add("medium", "appservice-legacy-tls", r.get("name"), "minTlsVersion=" + tls, "legacy TLS accepted", s)
@@ -2406,13 +2443,18 @@ def c_backup(ctx):
         elif state == "off":
             add("medium", "backup-soft-delete-off", dig(r, "name"), "softDeleteState=" + str(dig(soft, "softDeleteState") or dig(soft, "state")), "backup deletion cannot be reversed", str(dig(r, "subscriptionId")))
         if rtype.endswith("backupvaults"):
-            immut = p.get("immutabilitySettings") or {}
-            istate = str(immut.get("state") or "Disabled").lower()
-            mua = "enforced" if p.get("isMUAEnforced") in (True, "true", "True") else "not-enforced"
-            if istate in ("disabled", "unlocked", ""):
-                add("medium", "backup-immutability-off", r.get("name"), "immutabilitySettings=" + istate + " mua=" + (mua or "-"), "backup data can be altered or deleted", r.get("subscriptionId"))
-            if not p.get("isMUAEnforced"):
-                add("low", "backup-no-multi-user-auth", r.get("name"), "isMUAEnforced=false", "critical backup operations need no second approver", r.get("subscriptionId"))
+            raw_immut = dig(p, "securitySettings.immutabilitySettings.state")
+            istate = immutability(raw_immut)
+            # A Backup vault enforces multi-user authorization through a Resource Guard.
+            mua = on_off(dig(p, "isVaultProtectedByResourceGuard"))
+            if istate == "off":
+                add("medium", "backup-immutability-off", r.get("name"), "immutabilitySettings=" + str(raw_immut) + " mua=" + mua, "backup data can be altered or deleted", r.get("subscriptionId"))
+            elif istate == "unknown":
+                add("low", "backup-immutability-unknown", r.get("name"), "immutabilitySettings.state=" + (str(val(raw_immut, "")) or "not returned"), "immutability cannot be confirmed", r.get("subscriptionId"))
+            if mua == "off":
+                add("low", "backup-no-multi-user-auth", r.get("name"), "isVaultProtectedByResourceGuard=false", "critical backup operations need no second approver", r.get("subscriptionId"))
+            elif mua == "unknown":
+                add("low", "backup-mua-unknown", r.get("name"), "isVaultProtectedByResourceGuard not returned", "multi-user authorization cannot be confirmed", r.get("subscriptionId"))
         else:
             red = str(p.get("redundancySettings") or "")
             add("info", "recovery-services-vault", r.get("name"), "softDelete=" + (state or "-") + " redundancy=" + (red or "-"), "verify immutability and MUA separately", r.get("subscriptionId"))
@@ -2575,34 +2617,243 @@ def c_datapane(ctx):
 
 
 def scan_dynamic(ctx):
-    if ctx.get("dyn_done"):
-        return
-    with audit_scope(check="entra-dynamic-groups"):
-        c_dyn(ctx)
+    """Classify dynamic groups once, for any check that reads ctx["dyn"].
+
+    A caller whose verdict depends on the classification takes a denial when the
+    rules could not be read, so it cannot report a clean result.
+    """
+    if not ctx.get("dyn_done"):
+        with audit_scope(check="entra-dynamic-groups"):
+            c_dyn(ctx)
+    if (ctx.get("dyn_failed") or ctx.get("dyn_degraded")) and CURRENT["check"] != "entra-dynamic-groups":
+        deny(CURRENT["check"])
+
+
+def dynamic_groups(ctx):
+    """id -> (displayName, membershipRule, processingState) for every dynamic group.
+
+    Live Graph first; the AzureHound export when Graph is unreadable. None when
+    neither source could be read. Cached in ctx.
+    """
+    if "dyn_rules" in ctx:
+        if ctx.get("dyn_degraded") and ctx["dyn_rules"] is not None:
+            deny(CURRENT["check"])  # every reader of the export fallback is partial, not only the first
+        return ctx["dyn_rules"]
+    ctx["dyn_degraded"] = False
+    out = None
+    rows = graph_all("groups?$filter=groupTypes/any(c:c eq 'DynamicMembership')&$select=id,displayName,membershipRule,membershipRuleProcessingState", limit=20)
+    if rows is not None:
+        out = {str(dig(g, "id")): (str(val(dig(g, "displayName"), "")), str(val(dig(g, "membershipRule"), "")),
+                                   str(val(dig(g, "membershipRuleProcessingState"), ""))) for g in rows}
+    else:
+        denied_now(CURRENT["check"])  # the live read failed; the export is a weaker, possibly stale source
+        ctx["dyn_degraded"] = True
+        try:
+            idx = ctx["idx"]
+            out = {}
+            for g in idx.groups():
+                p = idx.props(g)
+                rule = str(val(dig(p, "membershipRule"), ""))
+                if rule:
+                    out[str(dig(g, "id"))] = (str(val(dig(p, "displayName"), "")), rule, str(val(dig(p, "membershipRuleProcessingState"), "")))
+        except DatasetUnavailable:
+            out = None
+    ctx["dyn_rules"] = out
+    return out
+
+
+# Who can steer a dynamic rule, from easiest to hardest.
+STEER_ORDER = ("guest", "device", "privileged", "fixed")
+STEER_OPEN = ("guest", "device")
+STEER_LABEL = {"guest": "anyone who can invite a guest", "device": "anyone who can register a device",
+               "privileged": "attribute writer (admin, on-prem sync or app with User.ReadWrite.All)"}
+MAILISH = ("user.mail", "user.othermails", "user.proxyaddresses", "user.userprincipalname")
+DEVICE_SET = ("device.displayname", "device.devicemodel", "device.devicemanufacturer", "device.deviceostype",
+              "device.deviceosversion", "device.accountenabled")
+RULE_TERM = re.compile(r'((?:user|device)\.[a-z0-9_.]+)\s+(?:-(?:any|all)\s*\(\s*_\s+)?(-[a-z]+)\s+("[^"]*"|\[[^\]]*\]|\S+)')
+
+
+def rule_steer(rule):
+    """(steer, attributes) for a dynamic membership rule.
+
+    steer is who can change membership: guest (an invited guest matches), device
+    (whoever registers a device sets the value), privileged (an admin, on-prem sync or
+    an app writes the attribute: extensionAttributeN, extension_<appId>_*, custom
+    security attributes, onPremises*, memberOf) or fixed.
+    -or picks the easiest branch, -and the hardest; -and binds tighter than -or, as in
+    Entra. A userType Member guard closes guest terms in its own -and group.
+    ponytail: token heuristic per leaf; -not is ignored and -match is read as loose.
+    Guest invite and device registration policy are not read.
+    """
+    text = re.sub(r"\s+", " ", str(rule or "").lower())  # the rule editor stores newlines and tabs
+    terms = RULE_TERM.findall(text)
+    if not terms:
+        return "fixed", []
+    return _steer_expr(text, False), sorted({a for a, _, _ in terms})
+
+
+RULE_GUARD = re.compile(r'^user\.usertype\s+-(?:eq\s+"?member|ne\s+"?guest|in\s+\[\s*"member"\s*\])')
+
+
+def _split_top(text, op):
+    """Split on op where it stands outside parentheses, brackets and quotes."""
+    parts, depth, quoted, start, i = [], 0, False, 0, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            quoted = not quoted
+        elif not quoted and ch in "([":
+            depth += 1
+        elif not quoted and ch in ")]":
+            depth -= 1
+        elif not quoted and depth == 0 and text.startswith(op, i):
+            parts.append(text[start:i])
+            i += len(op)
+            start = i
+            continue
+        i += 1
+    parts.append(text[start:])
+    return parts
+
+
+def _unwrap(expr):
+    """Strip parentheses that enclose the whole expression."""
+    e = expr.strip()
+    while e.startswith("(") and e.endswith(")"):
+        inner, depth = e[1:-1], 0
+        for ch in inner:
+            depth += ch == "("
+            depth -= ch == ")"
+            if depth < 0:
+                return e
+        e = inner.strip()
+    return e
+
+
+def _steer_expr(expr, guarded):
+    e = _unwrap(expr)
+    ors = _split_top(e, " -or ")
+    if len(ors) > 1:
+        return min((_steer_expr(x, guarded) for x in ors), key=STEER_ORDER.index)
+    ands = [_unwrap(x) for x in _split_top(e, " -and ")]
+    if len(ands) > 1:
+        rest = [x for x in ands if not RULE_GUARD.match(x)]
+        guarded = guarded or len(rest) < len(ands)
+        if not rest:
+            return "privileged"
+        return max((_steer_expr(x, guarded) for x in rest), key=STEER_ORDER.index)
+    terms = RULE_TERM.findall(e)
+    if not terms:
+        return "fixed"
+    return max((_steer_term(attr, op, value, guarded) for attr, op, value in terms), key=STEER_ORDER.index)
+
+
+def _steer_term(attr, op, value, guarded):
+    if attr == "user.usertype":
+        # -eq guest or -ne member selects guests; a Member guard alone needs a new member account.
+        return "guest" if (op in ("-eq", "-in")) == ("guest" in value) else "privileged"
+    loose = op not in ("-eq", "-in")
+    negated = op.startswith("-n")
+    # accountEnabled selects every enabled account only for "-eq true" or "-ne false".
+    every_enabled = attr.endswith(".accountenabled") and (("true" in value) == (op == "-eq"))
+    if attr.startswith("user."):
+        if not guarded and (attr == "user.displayname" or every_enabled or (attr in MAILISH and loose) or (attr == "user.objectid" and negated)):
+            return "guest"
+        if attr == "user.objectid" and not negated:
+            return "fixed"
+        return "privileged"
+    if attr in DEVICE_SET and (attr != "device.accountenabled" or every_enabled):
+        return "device"
+    if attr in ("device.objectid", "device.deviceid"):
+        return "fixed"
+    return "privileged"
+
+
+def group_node(ctx, gid):
+    """Chain label for a dynamic group. The id suffix keeps two groups that share a
+    display name apart in the dot graph."""
+    name = (dig(ctx, "dyn_rules", None) or {}).get(gid, ("",))[0]
+    return "group " + (name or gid) + " (" + str(gid)[:8] + ")"
+
+
+def _group_capabilities(ctx, gids):
+    """(gid -> [(rank, label)], gids not fully assessed) for what membership grants:
+    Azure RBAC and app roles.
+
+    rank 3 controls RBAC, 2 holds a dangerous Azure action, 1 reaches an application.
+    """
+    caps = defaultdict(list)
+    blind = set(sorted(gids)[40:])
+    for gid in sorted(gids)[:40]:
+        doc = graph("groups/" + gid + "/appRoleAssignments?$select=resourceDisplayName")
+        if doc is None:
+            denied_now(CURRENT["check"])
+            blind.add(gid)
+            continue
+        for a in lst(dig(doc, "value")):
+            caps[gid].append((1, "app " + str(val(dig(a, "resourceDisplayName"), "?"))))
+    sample(CURRENT["check"], min(len(gids), 40), len(gids), "dynamic groups checked for app access")
+    if not gids:
+        return caps, blind
+    if not ctx.get("subs"):
+        undecided("dynamic-group-rbac-unassessed", "subscriptions=0", "no subscription in scope; Azure RBAC granted to dynamic groups was not read")
+        return caps, set(gids)
+    rows = unread(arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where tostring(properties.principalType) =~ 'Group' | project principalId=tostring(properties.principalId), roleId=tolower(tostring(properties.roleDefinitionId)), scope=tostring(properties.scope), subscriptionId", ctx["subs"]),
+                  "Azure role assignments to groups", "dynamic-group-rbac-unassessed")
+    defs = unread(arg_rows(tenant_wide("AuthorizationResources | where type =~ 'microsoft.authorization/roledefinitions' | project id=tolower(id), name=tostring(properties.roleName), perms=properties.permissions"), ctx["subs"], scoped=False),
+                  "Azure role definitions", "dynamic-group-rbac-unassessed")
+    if rows is None or defs is None:
+        return caps, set(gids)
+    roles = {str(dig(d, "id")).split("/")[-1]: (str(dig(d, "name")), lst(dig(d, "perms"))) for d in defs}
+    for r in rows:
+        gid = str(dig(r, "principalId"))
+        if gid not in gids:
+            continue
+        name, perms = roles.get(str(dig(r, "roleId")).split("/")[-1], ("", []))
+        rank = 3 if grants_role_write(perms) else 2 if any(permits(p, t) for p in perms for t in DANGEROUS_ACTIONS) else 0
+        if rank:
+            caps[gid].append((rank, name + " on " + str(dig(r, "scope"))))
+    return caps, blind
 
 
 @check("entra-dynamic-groups")
 def c_dyn(ctx):
     if ctx.get("dyn_done"):
         return
-    idx = ctx["idx"]
-    n = 0
-    for g in idx.groups():
-        p = idx.props(g)
-        rule = p.get("membershipRule")
-        if not rule:
-            continue
-        n += 1
-        attrs = [a for a in ("displayName", "extensionAttribute1", "extensionAttribute2", "department", "jobTitle", "physicalIds", "deviceName") if a in rule]
-        src = "unknown"
-        if any(a.startswith("extensionAttribute") or a == "department" for a in attrs):
-            src = "on-prem writable attribute"
-        elif "displayName" in attrs or "jobTitle" in attrs:
-            src = "self-service or helpdesk writable attribute"
-        add("medium", "dynamic-group-writable-attribute", p.get("displayName") or g.get("id"), "rule=" + rule + " state=" + str(p.get("membershipRuleProcessingState")) + " attrs=" + (",".join(attrs) or "-") + " src=" + src, "membership selected by a mutable attribute")
-        ctx["dynamic"].add(g.get("id"))
     ctx["dyn_done"] = True
-    note("entra-dynamic-groups", n)
+    ctx.setdefault("dyn", {})
+    ctx.setdefault("dynamic", set())
+    groups = unread(dynamic_groups(ctx), "dynamic group rules", "dynamic-groups-unreadable")
+    if groups is None:
+        ctx["dyn_failed"] = True
+        note("entra-dynamic-groups", 0)
+        return
+    note("entra-dynamic-groups", len(groups))
+    steers = {gid: rule_steer(rule) for gid, (_name, rule, _state) in groups.items()}
+    for gid, (steer, _attrs) in steers.items():
+        ctx["dyn"][gid] = steer
+        ctx["dynamic"].add(gid)
+    caps, blind = _group_capabilities(ctx, [g for g, (s, _a) in steers.items() if s != "fixed"])
+    for gid, (name, rule, state) in groups.items():
+        label = name or gid
+        steer, attrs = steers[gid]
+        if state.lower() == "paused":
+            add("low", "dynamic-group-processing-paused", label, "membershipRuleProcessingState=Paused", "membership is frozen; the rule no longer decides who is in the group")
+        grants = sorted(caps.get(gid, []), reverse=True)
+        top = grants[0][0] if grants else 0
+        if steer in STEER_OPEN:
+            sev = ("low", "medium", "high", "critical")[top]
+        elif steer == "privileged":
+            sev = (None, None, "low", "medium")[top]
+        else:
+            sev = None
+        if not sev:
+            continue
+        add(sev, "dynamic-group-steerable", label,
+            "steer=" + steer + " attrs=" + (",".join(attrs) or "-") + " grants=" + (",".join(g for _r, g in grants[:3]) or ("not assessed" if gid in blind else "none")) + " rule=" + rule[:80],
+            "whoever can steer the rule decides who holds what the group grants")
+        if sev in ("critical", "high"):
+            chain("dynamic-group-to-capability", STEER_LABEL[steer] + " -> " + group_node(ctx, gid) + " -> " + grants[0][1], sev, "a rule an outsider can satisfy grants this access")
 
 
 @check("entra-group-roles")
@@ -2733,6 +2984,7 @@ def c_ca(ctx):
     requires_device = False
     for p in pols:
         state = p.get("state")
+        enforced = state == "enabled"
         name = p.get("displayName")
         cond = p.get("conditions") or {}
         users = cond.get("users") or {}
@@ -2742,34 +2994,33 @@ def c_ca(ctx):
         if state == "enabledForReportingButNotEnforced":
             add("high", "ca-policy-report-only", name, "state=report-only", "control documented but not enforced")
         for gid in users.get("excludeGroups") or []:
-            if gid in ctx["dynamic"]:
-                add("high", "ca-exclusion-dynamic-group", name, "excludeGroups includes " + str(ctx["idx"].resolve(gid) or gid), "rule-based membership removes the control")
-                chain("attribute-to-ca-bypass", "attribute -> " + str(ctx["idx"].resolve(gid) or gid) + " -> excluded from " + str(name), "high", "join the group, skip the policy")
+            steer = dig(ctx, "dyn", {}).get(gid)
+            if enforced and steer in STEER_OPEN + ("privileged",):
+                glabel = (dig(ctx, "dyn_rules", None) or {}).get(gid, (gid,))[0] or gid
+                sev = "high" if steer in STEER_OPEN else "medium"
+                add(sev, "ca-exclusion-dynamic-group", name, "excludeGroups includes " + glabel + " steer=" + steer, "rule-based membership removes the control")
+                if sev == "high":
+                    chain("attribute-to-ca-bypass", STEER_LABEL[steer] + " -> " + group_node(ctx, gid) + " -> excluded from " + str(name), sev, "join the group, skip the policy")
         if state == "enabled" and (users.get("excludeGroups") or users.get("excludeUsers")):
             add("low", "ca-policy-has-exclusions", name, "excludeGroups=" + str(len(users.get("excludeGroups") or [])) + " excludeUsers=" + str(len(users.get("excludeUsers") or [])), "exclusions are the bypass surface")
-        ctypes = cond.get("clientAppTypes") or []
-        ctypes = [str(c) for c in ctypes]
-        if state == "enabled" and ctypes and "other" not in ctypes and "all" not in [c.lower() for c in ctypes]:
-            add("medium", "ca-legacy-auth-not-blocked", name, "clientAppTypes=" + ",".join(ctypes), "legacy authentication not covered")
         flows = cond.get("authenticationFlows") or {}
         raw_methods = dig(flows, "transferMethods")
         methods = [str(x) for x in lst(raw_methods)] if isinstance(raw_methods, list) else ([str(raw_methods)] if raw_methods not in (MISSING, None, "") else [])
-        enforced = state == "enabled"
         if "deviceCodeFlow" in methods or (enforced and not methods and flows):
             blocks = state == "enabled" and "block" in [b.lower() for b in builtins]
             if blocks:
                 restricts_flows = True
             add("info", "ca-device-code-flow-referenced", name, "state=" + str(state) + " transferMethods=" + ",".join(methods) + " blocks=" + str(blocks), "device code flow is named in a policy; only an enforced Block control restricts it")
         locs = cond.get("locations") or {}
-        for lid in (locs.get("excludeLocations") or []):
+        for lid in (locs.get("excludeLocations") or []) if enforced else []:
             if lid == "AllTrusted":
                 add("high", "ca-all-trusted-locations-excluded", name, "excludeLocations=AllTrusted", "any trusted IP skips the policy")
             else:
                 add("medium", "ca-named-location-excluded", name, "excludeLocations=" + str(lid), "named location exclusion")
         devices = cond.get("devices") or {}
-        for dtype in (devices.get("excludeDevices") or {}).get("trustType") or []:
+        for dtype in ((devices.get("excludeDevices") or {}).get("trustType") or []) if enforced else []:
             add("high", "ca-trusttype-excluded", name, "excludeDevices.trustType=" + str(dtype), "that device trust class skips the policy")
-        if devices.get("deviceFilter"):
+        if enforced and devices.get("deviceFilter"):
             df = devices.get("deviceFilter") or {}
             add("medium", "ca-device-filter", name, "mode=" + str(df.get("mode")) + " rule=" + str(df.get("rule"))[:60], "device filter decides who is covered; verify the rule")
         device_controls = {"compliantdevice", "domainjoineddevice", "approvedapplication"}
@@ -2790,13 +3041,15 @@ def c_ca(ctx):
             add("medium" if single else "info", "ca-auth-strength", name, "strength=" + str(disp) + " combos=" + ",".join(combos)[:60], "custom authentication strength; verify the combinations")
         if gc.get("operator") == "OR" and len(builtins) > 1:
             add("medium", "ca-grant-operator-or", name, "operator=OR controls=" + ",".join(builtins), "any single control satisfies the policy")
-    if pols and not restricts_flows:
+    if pols and not ca_complete():
+        capped(CURRENT["check"], len(pols), "conditional access policy pages")
+    if pols and ca_complete() and not restricts_flows:
         add("high", "ca-device-code-flow-unrestricted", "tenant", "no policy sets conditions.authenticationFlows", "device code flow issues tokens with password-only authentication")
-    if pols and not has_frequency:
+    if pols and ca_complete() and not has_frequency:
         add("medium", "ca-no-signin-frequency", "tenant", "no sessionControls.signInFrequency", "stolen tokens stay valid for their full lifetime")
-    if pols and not has_risk:
+    if pols and ca_complete() and not has_risk:
         add("medium", "ca-no-risk-conditions", "tenant", "no signInRiskLevels or userRiskLevels", "no risk-based response; requires P2")
-    if pols and not requires_device:
+    if pols and ca_complete() and not requires_device:
         add("medium", "ca-no-device-requirement", "tenant", "no policy requires compliant or joined device", "device trust is not an access condition")
     for p in pols:
         for action in ((p.get("conditions") or {}).get("userActions") or []):
@@ -3105,7 +3358,7 @@ def c_graph_perms(ctx):
             nm = role_names.get(a.get("appRoleId"))
             if nm:
                 perms.append(nm)
-        dangerous = [x for x in perms if x in ("Directory.ReadWrite.All", "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All", "RoleManagement.ReadWrite.Directory", "Sites.FullControl.All", "Mail.ReadWrite", "User.ReadWrite.All", "Group.ReadWrite.All")]
+        dangerous = [x for x in perms if x in GRAPH_DANGEROUS]
         if dangerous:
             add("high", "sp-holds-graph-application-permission", s.get("displayName"), "permissions=" + ",".join(sorted(set(dangerous))), "application permission runs without a user and needs no consent at runtime")
     note("entra-graph-permissions", checked)
@@ -3725,15 +3978,73 @@ def c_app_hygiene(ctx):
         for uri in (a.get("publicClient") or {}).get("redirectUris") or []:
             if uri.startswith("http://") or uri.startswith("ms-appx") or "localhost" in uri:
                 add("low", "app-public-client-redirect", name, uri, "native redirect target; verify the client is not a confidential app")
-        graph_roles = 0
-        for res in a.get("requiredResourceAccess") or []:
-            if str(res.get("resourceAppId")) == GRAPH_APP_ID:
-                graph_roles += len([x for x in res.get("resourceAccess") or [] if x.get("type") == "Role"])
-        if graph_roles >= 3:
-            owners = graph("applications(appId='" + str(a.get("appId")) + "')/owners?$select=userPrincipalName")
-            humans = [str(dig(o, "userPrincipalName")) for o in lst(dig(owners, "value")) if dig(o, "userPrincipalName")]
-            if humans:
-                add("high", "high-priv-app-owned-by-human", name, "graphAppRoles=" + str(graph_roles) + " owners=" + ",".join(humans[:3]), "owner can add a secret and use the requested permissions")
+
+
+def _owner_takeover(cap=40):
+    """Users who own an app holding a dangerous granted application permission.
+
+    Starts from what is granted, not what an app requests, and reads both owner
+    lists: the app registration and the service principal. An owner of either can
+    add a credential and act with the app's permissions. Returns the number of
+    grants examined.
+    """
+    held = defaultdict(set)
+    examined = 0
+    for app_id, (label, wanted) in TAKEOVER_ROLES.items():
+        what = (label.rstrip(":") or "Microsoft Graph") + " service principal"
+        resource = unread(graph("servicePrincipals?$filter=appId eq '" + app_id + "'&$select=id,appRoles"),
+                          what, "app-owner-takeover-unassessed")
+        if resource is None:
+            continue
+        first = lst(dig(resource, "value"))[:1]
+        if not first:
+            continue  # the resource is not provisioned in this tenant; nothing can be granted on it
+        risky = {str(dig(r, "id")): label + str(dig(r, "value")) for r in lst(dig(first[0], "appRoles"))
+                 if str(dig(r, "value")) in wanted}
+        if not risky:
+            undecided("app-owner-takeover-unassessed", what + " appRoles unmapped", "permission ids could not be mapped to names, so no grant is classified")
+            continue
+        grants = unread(graph_all("servicePrincipals/" + str(dig(first[0], "id")) + "/appRoleAssignedTo", limit=20),
+                        what + " application permission grants", "app-owner-takeover-unassessed")
+        if grants is None:
+            continue
+        examined += len(grants)
+        for g in grants:
+            perm = risky.get(str(dig(g, "appRoleId")))
+            if perm and str(dig(g, "principalType")) == "ServicePrincipal":
+                held[str(dig(g, "principalId"))].add(perm)
+    sample(CURRENT["check"], min(len(held), cap), len(held), "service principals with dangerous grants")
+    for pid in sorted(held)[:cap]:
+        perms = sorted(held[pid])
+        sp = graph("servicePrincipals/" + pid + "?$select=appId,displayName,servicePrincipalType")
+        if sp is None:
+            if az_kind() != "absent":
+                denied_now(CURRENT["check"])
+                add("info", "app-owner-takeover-unassessed", pid, "granted=" + ",".join(perms) + " servicePrincipal unreadable", "owners of this privileged app were not assessed")
+            continue
+        name = str(val(dig(sp, "displayName"), pid))
+        sources = [("servicePrincipal", "servicePrincipals/" + pid + "/owners?$select=id,userPrincipalName")]
+        if str(dig(sp, "servicePrincipalType")) == "Application":
+            sources.append(("application", "applications(appId='" + str(dig(sp, "appId")) + "')/owners?$select=id,userPrincipalName"))
+        for via, path in sources:
+            rows = graph(path)
+            if rows is None:
+                # absent: a multi-tenant app whose registration lives in the publisher tenant.
+                if az_kind() != "absent":
+                    denied_now(CURRENT["check"])
+                    add("info", "app-owner-takeover-unassessed", name, via + " owners unreadable granted=" + ",".join(perms), "owners of this privileged app were not assessed")
+                continue
+            humans = [u for u in (str(val(dig(o, "userPrincipalName"), "")) for o in lst(dig(rows, "value"))) if u]
+            if not humans:
+                continue
+            tier0 = [p for p in perms if p in GRAPH_TIER0]
+            sev = "critical" if tier0 else "high"
+            add(sev, "high-priv-app-owned-by-human", name,
+                "via=" + via + " owners=" + ",".join(humans[:3]) + " granted=" + ",".join(perms),
+                "an owner can add a credential and act with these granted application permissions")
+            chain("owner-to-application-permissions", "user " + humans[0] + " -> owns " + name + " (" + pid[:8] + ") -> " + (tier0 or perms)[0], sev,
+                  "credential injection reaches directory role control" if tier0 else "credential injection into a privileged application")
+    return examined
 
 
 @check("entra-sp-credentials")
@@ -3821,40 +4132,7 @@ def c_consent(ctx):
 
 @check("entra-privileged-sps")
 def c_sps(ctx):
-    idx = ctx["idx"]
-    targets = []
-    for s in idx.sps():
-        targets.append(s)
-    if not targets:
-        note("entra-privileged-sps", 0)
-        return
-    n = 0
-    sp_index = graph_all("servicePrincipals?$select=id,appId", limit=20)
-    if sp_index is None:
-        denied_now("entra-privileged-sps")
-    high_value_ids = {str(dig(x, "id")) for x in lst(sp_index) if str(dig(x, "appId")) in HIGH_VALUE_RESOURCES}
-    sample("entra-privileged-sps", min(len(targets), 40), len(targets), "service principals")
-    for s in targets[:40]:
-        sp_id = s.get("id")
-        roles = graph("servicePrincipals/" + str(sp_id) + "/appRoleAssignments")
-        if roles is None:
-            deny("entra-privileged-sps")
-            continue
-        vals = lst(dig(roles, "value"))
-        n += 1
-        privileged = [a for a in vals if str(dig(a, "resourceId")) in high_value_ids and str(dig(a, "appRoleId")) not in LOW_PRIVILEGE_APP_ROLES]
-        if not privileged:
-            continue
-        owner_rows = graph("servicePrincipals/" + str(sp_id) + "/owners?$select=id,displayName,userPrincipalName")
-        if owner_rows is None:
-            deny("entra-privileged-sps")
-            add("info", "privileged-sp-owners-unreadable", str(idx.name(s)), "owners unreadable", "owner inheritance into this principal was not assessed")
-            continue
-        humans = [o.get("userPrincipalName") for o in owner_rows.get("value") or [] if o.get("userPrincipalName")]
-        if humans:
-            add("high", "privileged-sp-owned-by-human", idx.name(s), "owners=" + ",".join(humans) + " appRoles=" + str(len(privileged)), "owner can add a credential and inherit the application permissions")
-            chain("owner-to-application-permissions", "user " + humans[0] + " -> owns " + idx.name(s) + " -> " + str(len(vals)) + " app roles", "high", "credential injection into a privileged service principal")
-    note("entra-privileged-sps", n, denied=DENIED["entra-privileged-sps"])
+    note("entra-privileged-sps", _owner_takeover())
 
 
 @check("entra-devices")
@@ -4514,20 +4792,17 @@ def c_synced_admins(ctx):
 @check("entra-password-policy")
 def c_pwpolicy(ctx):
     idx = ctx["idx"]
-    assignments = graph_all("roleManagement/directory/roleAssignments", limit=5)
-    if assignments is None:
-        note("entra-password-policy", 0, denied=1)
+    users = idx.users()
+    note("entra-password-policy", len(users))
+    if not users:
         return
-    holders = {a.get("principalId") for a in assignments}
-    n = 0
-    for u in idx.users():
-        p = idx.props(u)
-        pol = p.get("passwordPolicies")
-        if isinstance(pol, str) and "DisablePasswordExpiration" in pol:
-            n += 1
-            sev = "high" if u.get("id") in holders else "medium"
-            add(sev, "password-never-expires", p.get("userPrincipalName") or u.get("id"), "passwordPolicies=DisablePasswordExpiration role_holder=" + str(u.get("id") in holders), "credential valid indefinitely")
-    note("entra-password-policy", n)
+    expired = [u for u in users if "DisablePasswordExpiration" in str(idx.props(u).get("passwordPolicies") or "")]
+    add("info", "password-expiry-disabled", "tenant", "users=" + str(len(expired)) + " of " + str(len(users)),
+        "no periodic expiry; Microsoft recommends this state when MFA and banned-password protection are enforced")
+    if len(expired) < len(users):
+        add("info", "password-expiry-enforced", "tenant", "users=" + str(len(users) - len(expired)) + " of " + str(len(users)),
+            "periodic expiry is still enforced for these users; Microsoft no longer recommends forced rotation",
+            repro="jq -r '.data[] | select(.kind==\"AZUser\") | select((.properties.passwordPolicies|tostring|test(\"DisablePasswordExpiration\"))|not) | .properties.userPrincipalName' azurehound.json")
 
 
 @check("entra-enterprise-apps")
@@ -4693,8 +4968,6 @@ def c_governance(ctx):
     if reviews is None or packages is None:
         add("info", "governance-not-assessed", "tenant", "endpoint unavailable", "access reviews and entitlement management not assessed (needs P2 or Governance)")
         return
-    if not reviews:
-        add("medium", "no-access-reviews", "tenant", "0 access review definitions", "no periodic recertification of group or app access")
     for r in reviews[:10]:
         add("info", "access-review", r.get("displayName"), "status=" + str(r.get("status")), "recertification definition")
     for pk in packages[:10]:
@@ -6062,6 +6335,8 @@ def c_mfa_baseline(ctx):
         add("info", "mfa-all-users-covered", "tenant", "policies=" + ",".join([str(x) for x in covers_all]), "an enforced policy requires MFA for all users and apps; any exclusion shown in brackets is a bypass")
     elif strength_unknown and any(val(dig(p, "grantControls.authenticationStrength"), "") for p in enabled):
         add("info", "mfa-baseline-unassessed", "tenant", "authenticationStrength unreadable enforcedPolicies=" + str(len(enabled)), "the policy set uses custom authentication strengths, so the MFA requirement cannot be confirmed or denied")
+    elif not ca_complete():
+        capped("entra-mfa-baseline", len(pols), "conditional access policy pages")
     else:
         add("high", "mfa-not-required-for-all", "tenant", "securityDefaults=off coveringPolicies=0 enforcedPolicies=" + str(len(enabled)), "no policy requires MFA for all users and all applications")
 
@@ -6626,11 +6901,17 @@ def c_implicit(ctx):
         return
     note("entra-implicit-grant", len(apps))
     for a in apps:
-        imp = ((a.get("web") or {}).get("implicitGrantSettings") or {})
-        if tri(imp.get("enableAccessTokenIssuance")) is True:
-            add("high", "implicit-access-token", a.get("displayName"), "enableAccessTokenIssuance=true", "implicit flow returns tokens in the fragment; no PKCE")
-        if tri(imp.get("enableIdTokenIssuance")) is True:
-            add("low", "implicit-id-token", a.get("displayName"), "enableIdTokenIssuance=true", "implicit id token flow enabled")
+        imp = dig(a, "web.implicitGrantSettings", {})
+        redirects = [str(u) for u in lst(dig(a, "web.redirectUris"))]
+        if not redirects:
+            continue
+        if tri(dig(imp, "enableAccessTokenIssuance")) is True:
+            weak = [u for u in redirects if not u.lower().startswith("https://")]
+            add("high", "implicit-access-token", dig(a, "displayName"),
+                "enableAccessTokenIssuance=true redirectUris=" + str(len(redirects)) + (" nonHttps=" + str(len(weak)) if weak else ""),
+                "the implicit flow is reachable: an access token returns in the fragment and no PKCE protects the response")
+        if tri(dig(imp, "enableIdTokenIssuance")) is True:
+            add("low", "implicit-id-token", dig(a, "displayName"), "enableIdTokenIssuance=true redirectUris=" + str(len(redirects)), "implicit id token flow enabled on a reachable web redirect URI")
 
 
 @check("entra-api-scopes")
@@ -6913,6 +7194,9 @@ def c_legacy_block(ctx):
         excludes = lst(dig(users, "excludeUsers")) + lst(dig(users, "excludeGroups")) + lst(dig(users, "excludeRoles"))
         if ("other" in ctypes or "exchangeactivesync" in ctypes or "all" in ctypes) and "block" in controls:
             blocks.append(str(dig(p, "displayName")) + ("(exclusions=" + str(len(excludes)) + ")" if excludes else ""))
+    if not ca_complete():
+        capped("entra-legacy-auth-block", len(pols), "conditional access policy pages")
+        return
     if blocks:
         add("info", "legacy-auth-blocked", "tenant", "policies=" + ",".join(str(b) for b in blocks), "legacy authentication is blocked by an enforced policy")
     else:
@@ -7179,10 +7463,16 @@ def c_rsv(ctx):
             add("medium", "rsv-softdelete-off", dig(r, "name"), "softDeleteState=" + str(dig(r, "soft")), "deleted backups cannot be recovered", s)
         elif soft_state == "unknown":
             add("low", "rsv-softdelete-unknown", dig(r, "name"), "softDeleteState=" + str(val(dig(r, "soft"), "not returned")), "recovery posture cannot be confirmed", s)
-        if str(val(dig(r, "immut"), "")).lower() in ("", "disabled", "unlocked"):
-            add("medium", "rsv-immutability-off", dig(r, "name"), "immutabilityState=" + str(val(dig(r, "immut"), "unset")), "backup data can be altered by a privileged principal", s)
-        if str(val(dig(r, "enhanced"), "")).lower() not in ("enabled", "alwayson"):
-            add("low", "rsv-enhanced-softdelete-off", dig(r, "name"), "enhancedSecurityState=" + str(val(dig(r, "enhanced"), "unset")), "soft delete cannot be extended or made irreversible", s)
+        immut = immutability(dig(r, "immut"))
+        if immut == "off":
+            add("medium", "rsv-immutability-off", dig(r, "name"), "immutabilityState=" + str(dig(r, "immut")), "backup data can be altered by a privileged principal", s)
+        elif immut == "unknown":
+            add("low", "rsv-immutability-unknown", dig(r, "name"), "immutabilityState=" + (str(val(dig(r, "immut"), "")) or "not returned"), "immutability cannot be confirmed", s)
+        enhanced = on_off(dig(r, "enhanced"))
+        if enhanced == "off":
+            add("low", "rsv-enhanced-softdelete-off", dig(r, "name"), "enhancedSecurityState=" + str(dig(r, "enhanced")), "soft delete cannot be extended or made irreversible", s)
+        elif enhanced == "unknown":
+            add("low", "rsv-enhanced-softdelete-unknown", dig(r, "name"), "enhancedSecurityState=" + (str(val(dig(r, "enhanced"), "")) or "not returned"), "enhanced soft delete cannot be confirmed", s)
 
 
 @check("sub-defender-securescore")
@@ -7545,8 +7835,11 @@ def c_appinsights(ctx):
     for r in rows:
         s = str(dig(r, "subscriptionId"))
         name = str(dig(r, "name"))
-        if str(val(dig(r, "localAuth"), "")).lower() not in ("true",):
-            add("medium", "appinsights-local-auth", name, "DisableLocalAuth=" + str(val(dig(r, "localAuth"), "not returned")), "instrumentation keys allow unauthenticated log injection", s)
+        local_off = on_off(dig(r, "localAuth"))
+        if local_off == "off":
+            add("medium", "appinsights-local-auth", name, "DisableLocalAuth=" + str(dig(r, "localAuth")), "instrumentation keys allow unauthenticated log injection", s)
+        elif local_off == "unknown":
+            add("low", "appinsights-local-auth-unknown", name, "DisableLocalAuth not returned", "the platform default allows local auth; confirm the actual setting", s)
         if str(val(dig(r, "publicIngest"), "")).lower() == "enabled":
             add("low", "appinsights-public-ingest", name, "publicNetworkAccessForIngestion=Enabled", "telemetry ingestion accepts traffic from any network", s)
         days = num(dig(r, "retention"))
@@ -7936,8 +8229,10 @@ def c_csa(ctx):
     if not sets:
         add("info", "no-custom-attributes", "tenant", "0 definitions", "no attribute-based access control surface")
         return
-    groups = graph_all("groups?$select=id,displayName,membershipRule,groupTypes&$top=200", limit=5, beta=True)
-    rules = [str(dig(g, "membershipRule")) for g in (groups if groups is not None else [])]
+    dyn = unread(dynamic_groups(ctx), "dynamic group rules", "csa-usage-unassessed")
+    if dyn is None:
+        return
+    rules = [rule for _name, rule, _state in dyn.values()]
     for d in sets:
         name = str(dig(d, "name"))
         used = any("customSecurityAttribute" in r or name.lower() in r.lower() for r in rules)
@@ -7952,7 +8247,7 @@ def c_review_health(ctx):
         return
     note("entra-access-review-health", len(rows))
     if not rows:
-        add("info", "no-access-reviews", "tenant", "0 definitions", "no access review is configured")
+        add("medium", "no-access-reviews", "tenant", "0 definitions", "no access review is configured")
         return
     for d in rows:
         sched = dig(d, "instanceEnumerationScope")
@@ -9184,7 +9479,7 @@ def c_xtenant_escalation(ctx):
             roles = [str(dig(a2, "roleDefinitionId")) for a2 in auth]
             edges += 1
             add("critical", "cross-tenant-control-plane-access", dig(r, "name"), "managedByTenantId=" + (tenant_name(manager) or manager) + " principals=" + str(len(auth)), "another tenant holds delegated control over this subscription", str(dig(r, "subscriptionId")))
-            chain("external-tenant-to-subscription", "tenant " + (tenant_name(manager) or manager) + " -> Lighthouse -> subscription " + str(dig(r, "subscriptionId")) + " roles=" + str(len(roles)), "critical", "control-plane access is held outside this directory")
+            chain("external-tenant-to-subscription", "tenant " + (tenant_name(manager) or manager) + " -> Lighthouse subscription " + str(dig(r, "subscriptionId")) + " roles=" + str(len(roles)), "critical", "control-plane access is held outside this directory")
         for r in lst(lap):
             edges += 1
             add("high", "cross-tenant-azure-rbac", dig(r, "principalId"), "scope=" + str(dig(r, "scope")) + " role=" + str(dig(r, "roleId")).split("/")[-1], "a principal from another tenant holds Azure RBAC here", str(dig(r, "subscriptionId")))
@@ -9230,6 +9525,8 @@ def with_tenant(tenant_id, fn):
     saved_failed = set(TENANT_FAILED)
     saved_trunc = set(TRUNC_KEYS)
     saved_scopes = dict(SCOPE_NAMES)
+    saved_paths = list(TRUNCATED)
+    TRUNCATED.clear()
     CFG["tenant"] = str(tenant_id)
     HOME_TENANT["id"] = str(tenant_id).lower()
     HOME_TENANT["name"] = tenant_name(tenant_id)
@@ -9253,6 +9550,8 @@ def with_tenant(tenant_id, fn):
         TRUNC_KEYS.update(saved_trunc)
         SCOPE_NAMES.clear()
         SCOPE_NAMES.update(saved_scopes)
+        peer_paths = ["tenant " + str(tenant_id) + ": " + str(p) for p in TRUNCATED]
+        TRUNCATED[:] = saved_paths + [p for p in peer_paths if p not in saved_paths]
         CACHE.clear()
         CACHE.update(saved_cache)
         CA_CACHE.clear()
@@ -9341,10 +9640,10 @@ def c_peer_privilege(ctx):
         same_upn = [h for h in holders if h[1] and upn_canonical(h[1]) in home_addresses]
         for _pid, upn, role, _kind in same_upn:
             add("critical", "identity-privileged-in-both-tenants", upn, "role=" + role + " peer=" + label, "one principal name is privileged in both directories")
-            chain("dual-tenant-privilege", str(upn) + " -> " + role + " -> " + label, "critical", "one compromised account reaches two directories")
+            chain("dual-tenant-privilege", str(upn) + " -> " + role + " in " + label, "critical", "one compromised account reaches two directories")
         for upn, role in info["guestRoles"]:
             add("high", "peer-guest-holds-role", upn or "unknown", "role=" + role + " peer=" + label, "an external identity holds a privileged role in that directory; if it comes from here, this tenant's compromise reaches it")
-            chain("guest-to-peer-role", str(upn) + " -> guest -> " + role + " -> " + label, "high", "guest privilege granted in the peer directory")
+            chain("guest-to-peer-role", str(upn) + " (guest) -> " + role + " in " + label, "high", "guest privilege granted in the peer directory")
 
     if not reviewed:
         add("low", "peer-tenant-none-readable", "tenant", "peers=" + str(len(peers)) + " readable=0", "the login could not read any peer directory")
@@ -9386,7 +9685,7 @@ def c_ga_count(ctx):
     elif len(holders) < 2:
         add("low", "single-global-administrator", "tenant", "holders=" + str(len(holders)), "one administrator is a single point of failure for recovery")
     else:
-        add("info", "global-administrator-count", "tenant", "holders=" + str(len(holders)), "within the recommended band")
+        add("info", "global-administrator-count-ok", "tenant", "holders=" + str(len(holders)), "within the recommended band")
 
 
 @check("entra-multitenant-apps")
@@ -9722,18 +10021,57 @@ class Tee:
         self.fh.close()
 
 
-def dot(path, chains=None):
-    items = CHAINS if chains is None else chains
+def _dot_label(text):
+    """A graphviz-safe single-line label, truncated to keep the graph readable."""
+    raw = str(text).strip()
+    for old, new in (("\\", "\\\\"), ('"', "'"), ("{", "("), ("}", ")"), ("[", "("), ("]", ")"), ("\n", " ")):
+        raw = raw.replace(old, new)
+    return raw[:120]
+
+
+def dot(path, rows=None):
+    """Graphviz of the attack chains, one node per chain id and one per entity.
+
+    Equal entity labels are one node, so paths that share an entity join. Chain
+    authors keep middle labels specific to one entity; a generic middle label would
+    join unrelated paths. Each chain has its own node, so the graph names the chain
+    rather than only its path.
+    """
+    if rows is None:
+        rows = [{"id": "CH-" + str(i + 1).zfill(2), "chain": c} for i, c in enumerate(CHAINS)]
+    items = rows
+    ids = {}
+    chain_nodes = set()
+    hot = set()
+    edges = {}
+    for row in items:
+        c = row["chain"]
+        cid = "c" + str(row["id"]).replace("-", "")
+        chain_nodes.add(cid)
+        ids[_dot_label(str(row["id"]) + " " + str(c["chain"]))] = cid
+        if c["severity"] in ("critical", "high"):
+            hot.add(cid)
+        prev = None
+        first = None
+        for part in str(c["path"]).split(" -> "):
+            label = _dot_label(part)
+            if not label:
+                continue
+            nid = ids.setdefault(label, "n%d" % len(ids))
+            if c["severity"] in ("critical", "high"):
+                hot.add(nid)
+            if first is None:
+                first = nid
+            if prev is not None and prev != nid:
+                edges[(prev, nid)] = True
+            prev = nid
+        if first is not None and first != cid:
+            edges[(cid, first)] = True
     lines = ["digraph chains {", "  rankdir=LR;", "  node [shape=box, fontsize=10];"]
-    for i, c in enumerate(items):
-        parts = [p.strip() for p in c["path"].split("->")]
-        for j, p in enumerate(parts):
-            nid = "n%d_%d" % (i, j)
-            color = "red" if c["severity"] in ("critical", "high") else "orange"
-            label = str(p).replace("\\", "\\\\").replace('"', "'").replace("{", "(").replace("}", ")").replace("[", "(").replace("]", ")").replace("\n", " ")
-            lines.append('  %s [label="%s", color=%s];' % (nid, label[:120], color))
-            if j:
-                lines.append('  n%d_%d -> n%d_%d;' % (i, j - 1, i, j))
+    for label, nid in ids.items():
+        shape = ", shape=note" if nid in chain_nodes else ""
+        lines.append('  %s [label="%s", color=%s%s];' % (nid, label, "red" if nid in hot else "orange", shape))
+    lines += ["  %s -> %s;" % e for e in edges]
     lines.append("}")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -9759,7 +10097,8 @@ def _string_literals(node):
 
 
 TRANSPORT_RESULT_CALLS = ("graph(", "graph_all(", "arg_rows(", "arg(", "per_sub(", "ca_all(", "arm(",
-                         "_kv_rows(", "_kv_vaults(", "kv_rows(", "az(", "scan_guests(", "scan_dynamic(", "_strengths(")
+                         "_kv_rows(", "_kv_vaults(", "kv_rows(", "az(", "scan_guests(", "scan_dynamic(", "_strengths(",
+                         "dynamic_groups(")
 
 
 def _transport_value(node):
@@ -9883,7 +10222,7 @@ def _silent_coercions(source):
 
 
 def _declared(source):
-    """(check names, finding ids emitted, finding ids that are computed, note/deny names)."""
+    """(check names, ids emitted, ids computed, note/deny names, static id severities)."""
     tree = ast.parse(source)
     names = []
     for node in ast.walk(tree):
@@ -9895,6 +10234,7 @@ def _declared(source):
     emitted = Counter()
     computed = []
     attributed = []
+    static = defaultdict(set)
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
             continue
@@ -9907,11 +10247,13 @@ def _declared(source):
             if lit:
                 for i in lit:
                     emitted[i] += 1
+                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[1], ast.Constant):
+                    static[lit[0]].add(str(node.args[0].value))
             else:
                 computed.append((node.lineno, ast.unparse(node.args[1])[:60]))
         elif node.func.id in ("note", "deny") and node.args:
             attributed.append((node.lineno, node.func.id, _string_literals(node.args[0])))
-    return names, emitted, computed, attributed
+    return names, emitted, computed, attributed, static
 
 
 def _read_baseline(path):
@@ -9972,7 +10314,7 @@ def lint(path=None):
         print("  %-28s %4d  %-14s %s" % (name, n, token, why))
     failures = []
 
-    names, emitted, computed, attributed = _declared(source)
+    names, emitted, computed, attributed, static = _declared(source)
     known = set(names)
     for lineno, kind, lits in attributed:
         for lit in lits:
@@ -9998,6 +10340,9 @@ def lint(path=None):
     for i in sorted(emitted):
         if i not in FRAMEWORK and _infer(i) == "MISC-":
             failures.append("finding id has no register tag: " + i + " (add a FRAMEWORK row)")
+    for finding_id, severities in sorted(static.items()):
+        if len(severities) > 1:
+            failures.append("finding id carries several severities: " + finding_id + " (" + ", ".join(sorted(severities)) + "); one id is one misconfiguration at one severity")
 
     baseline = os.path.join(os.path.dirname(path), ".lint-baseline")
     allowed, allowed_per = _read_baseline(baseline)
@@ -10164,9 +10509,14 @@ def main():
     out = [f for f in out_all if SEV[f["severity"]] <= floor]
     out.sort(key=lambda f: (SEV[f["severity"]], -f["score"], f["subscription"], f["check"]))
     chains = [c for c in CHAINS if SEV[c["severity"]] <= floor]
+    ordered = sorted(chains, key=lambda c: (SEV[c["severity"]], str(c["chain"]), str(c["path"])))
+    chain_rows = [{"id": "CH-" + str(i + 1).zfill(2), "chain": c} for i, c in enumerate(ordered)]
+    chains_by_check = defaultdict(list)
+    for row in chain_rows:
+        chains_by_check[str(row["chain"]["source"])].append(str(row["id"]))
 
     if args.baseline:
-        keys = sorted({baseline_key(f) for f in out_all})
+        keys = sorted({baseline_key(f) for f in out_all} | {"chain|" + str(c["severity"]) + "|" + str(c["chain"]) + "|" + str(c["path"]) for c in CHAINS})
         prior = set()
         if os.path.exists(args.baseline):
             with open(args.baseline, "r", encoding="utf-8") as fh:
@@ -10250,10 +10600,12 @@ def main():
     for f in out:
         print("%-9s %3s %-14s %-32s %-32s %s" % (f["severity"], f["score"], str(f["subscription"])[:14], f["check"][:32], str(f["subject"])[:32], f["evidence"][:70]))
 
-    if chains:
+    if chain_rows:
         print("\n=== chains ===")
-        for c in chains:
-            print(c["severity"] + " " + c["chain"] + ": " + c["path"])
+        print("chains: " + str(len(chain_rows)) + "; each id is repeated in the findings below")
+        for row in chain_rows:
+            c = row["chain"]
+            print(row["id"] + " " + c["severity"] + " " + c["chain"] + " [" + str(c["source"]) + "]: " + c["path"])
 
 
     lines = []
@@ -10272,6 +10624,9 @@ def main():
         lines.append("  evidence : " + str(f["evidence"]))
         lines.append("  why      : " + str(f["why"]))
         lines.append("  repro    : " + str(f["repro"]))
+        linked = chains_by_check.get(str(f["source"]))
+        if linked:
+            lines.append("  chains   : " + ", ".join(linked))
     print("\n".join(lines))
 
     if chains:
@@ -10279,15 +10634,17 @@ def main():
         print("#" * 100)
         print("# ATTACK CHAINS")
         print("#" * 100)
-        for c in chains:
+        for row in chain_rows:
+            c = row["chain"]
             print("")
-            print("[%s] %s" % (c["severity"].upper(), c["chain"]))
+            print("[%s] %s %s" % (c["severity"].upper(), row["id"], c["chain"]))
+            print("  check: " + str(c["source"]))
             print("  path : " + c["path"])
             print("  why  : " + c["why"])
 
     if args.dot:
-        dot(args.dot, chains)
-        print("\nwrote " + args.dot + " (" + str(len(chains)) + " chains)")
+        dot(args.dot, chain_rows)
+        print("\nwrote " + args.dot + " (" + str(len(chain_rows)) + " chains)")
 
     if tee is not None:
         _tee_restore(tee)
@@ -10295,7 +10652,7 @@ def main():
 
     if args.fail_on:
         limit = SEV[args.fail_on]
-        if any(SEV[f["severity"]] <= limit for f in out_all):
+        if any(SEV[f["severity"]] <= limit for f in out_all) or any(SEV[c["severity"]] <= limit for c in CHAINS):
             return 1
     if args.strict:
         bad = [n for n, c in COVERAGE.items() if c.get("status") in ("partial", "absent", "error", "truncated", "failed", "degraded", "throttled")]

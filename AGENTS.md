@@ -128,7 +128,7 @@ attribution behind.
 
 ## Lint gates
 
-`--lint` runs four gates and exits 1 on any failure.
+`--lint` runs six gates and exits 1 on any failure.
 
 | Gate | Rejects |
 |---|---|
@@ -137,6 +137,7 @@ attribution behind.
 | Failed reads | `if X is None: X = []` after a transport call, `lst(<read>)`, `<read> or []`, including on a local name that holds the result. |
 | Scope declaration | A `scoped=False` query with no `subscriptionId` predicate, not wrapped in `tenant_wide()` or `filtered_in_python()`. |
 | Finding identity | Two spellings of one id, an id with no register tag. |
+| Finding severity | One id at two static severities: the same id must mean one misconfiguration at one severity. |
 
 A gate failure is a code defect, not a baseline problem. Fix the code.
 

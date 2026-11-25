@@ -1,9 +1,9 @@
-total 1369
+total 1338
 check entra-admin-unit-scope 5
 check entra-agent-identities 1
 check entra-api-scopes 7
 check entra-app-assignments 5
-check entra-app-hygiene 13
+check entra-app-hygiene 6
 check entra-app-management-policy 7
 check entra-app-owned-by-sp 2
 check entra-app-ownerless 8
@@ -18,7 +18,7 @@ check entra-auth-methods-policy 12
 check entra-authenticator-features 5
 check entra-authorization-policy 13
 check entra-breakglass 9
-check entra-ca 46
+check entra-ca 44
 check entra-ca-inventory 15
 check entra-ca-matrix 5
 check entra-ca-roles 6
@@ -39,7 +39,7 @@ check entra-devices 8
 check entra-domain-takeover 7
 check entra-dormant 1
 check entra-dormant-guests 5
-check entra-dynamic-groups 6
+check entra-dynamic-groups 1
 check entra-enterprise-apps 1
 check entra-escalation-roles 6
 check entra-external-collab 7
@@ -55,7 +55,6 @@ check entra-guests-with-roles 7
 check entra-hybrid-sync 6
 check entra-identity-protection 1
 check entra-immutableid 3
-check entra-implicit-grant 6
 check entra-legacy-graph 12
 check entra-licences 5
 check entra-linked-identities 2
@@ -64,11 +63,10 @@ check entra-mfa-registration 3
 check entra-named-locations 7
 check entra-nested-role-groups 6
 check entra-organization 5
-check entra-password-policy 6
+check entra-password-policy 1
 check entra-pim-depth 3
 check entra-pim-policy 2
 check entra-pim-role-settings 11
-check entra-privileged-sps 6
 check entra-public-groups 2
 check entra-redirect-uri 5
 check entra-risky-signins 7

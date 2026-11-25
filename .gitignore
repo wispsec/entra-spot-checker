@@ -5,6 +5,7 @@ __pycache__/
 # Tool caches
 .ruff_cache/
 .pytest_cache/
+.serena/
 
 # Default AzureHound export path: a full tenant dump, never commit it
 azurehound.json

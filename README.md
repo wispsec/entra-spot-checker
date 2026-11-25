@@ -18,7 +18,8 @@ self-test ships next to it.
 - Prints a coverage table that states, per check, what was examined and what
   was denied, absent, truncated, throttled, degraded or failed.
 - Prints attack chains when a finding composes with another into an escalation
-  path.
+  path. Every chain carries an id (`CH-01`), the check that produced it, and the
+  id is repeated in the detail block of each finding that belongs to it.
 
 Read-only. It issues GET requests and a small number of POST `/list` calls.
 It never writes to the tenant.
@@ -58,7 +59,7 @@ python3 enumerate-entra.py \
 | `--no-az` | Skip every check that needs the CLI. The checks that read only the AzureHound export still run and are the whole result. Skipped checks are recorded with status `skipped`. |
 | `--no-entra` | Skip every Entra and Graph check, including the sub-* checks that call Graph. Skipped checks are recorded with status `skipped`. |
 | `--report FILE` | Write the same text report to a file. The file is a byte-identical copy of stdout. |
-| `--dot FILE` | Write a graphviz rendering of the attack chains. |
+| `--dot FILE` | Write a graphviz rendering of the attack chains. Each chain is its own node, labelled with its `CH-nn` id. |
 | `--baseline FILE` | One line per finding, `severity|check|subject|subscription|scope`. First run writes it; later runs print new, severity-changed and resolved entries. A run narrowed by `--check`, `--no-subs`, `--no-az`, `--no-entra`, `--include-vms` or `--peer-tenant` merges into the file instead of replacing it, and a key that survives the merge is never reported as resolved. |
 | `--check a,b` | Run only the named checks. Unknown names exit 2. |
 | `--min-severity S` | Lowest severity to print. Does not affect `--fail-on`. |
@@ -92,7 +93,11 @@ Report sections, in order:
 6. `blind spots` — checks that did not complete cleanly, with the reason.
 7. `by subscription` — severity counts and resource totals.
 8. `findings` — one line per finding.
-9. Per-finding detail blocks grouped by subscription, then attack chains.
+9. `chains` — one line per chain: id, severity, name, owning check, path.
+10. Per-finding detail blocks grouped by subscription. A block lists the chain
+    ids its check produced in a `chains` line.
+11. `attack chains` — one block per chain: id, severity, name, owning check,
+    path, reason.
 
 ### Coverage status values
 
