@@ -459,6 +459,41 @@ def ca_complete():
     return not any(p in TRUNCATED for p in CA_PATH_POLICIES)
 
 
+SKU_CACHE = {"state": "", "names": set()}
+
+
+def tenant_skus():
+    """Service plan and SKU part names in the tenant, or None when the read failed."""
+    if SKU_CACHE["state"] == "ok":
+        return SKU_CACHE["names"]
+    if SKU_CACHE["state"] == "failed":
+        return None
+    rows = graph_all("subscribedSkus", limit=3)
+    if rows is None:
+        SKU_CACHE["state"] = "failed"
+        return None
+    names = set()
+    for sku in rows:
+        part = str(dig(sku, "skuPartNumber")).upper()
+        if part:
+            names.add(part)
+        for plan in lst(dig(sku, "servicePlans")):
+            label = str(dig(plan, "servicePlanName")).upper()
+            if label:
+                names.add(label)
+    SKU_CACHE["state"] = "ok"
+    SKU_CACHE["names"] = names
+    return names
+
+
+def licensed(plans):
+    """True when every named plan is present, False when one is missing, None when unread."""
+    names = tenant_skus()
+    if names is None:
+        return None
+    return all(str(plan).upper() in names for plan in plans)
+
+
 def graph(path, beta=False):
     key = "graph:" + ("beta:" if beta else "") + path
     if key in CACHE:
@@ -987,6 +1022,27 @@ def any_source(text):
     return net is not None and net.prefixlen == 0
 
 
+DEFENDER_FREE_BY_DESIGN = ("cloudposture",)
+
+
+def address_span(start, end):
+    """(low, high) integers for an address range, or None when either end is unreadable."""
+    low = _network(start)
+    high = _network(end)
+    if low is None or high is None or low.version != high.version:
+        return None
+    return int(low.network_address), int(high.broadcast_address)
+
+
+def span_covers_all(start, end):
+    """True when the range admits every address of its family."""
+    span = address_span(start, end)
+    if span is None:
+        return False
+    bits = 32 if "." in str(start) else 128
+    return span[0] == 0 and span[1] == (1 << bits) - 1
+
+
 def on_off(value):
     """Normalised state for the state strings different resource providers use."""
     text = str(val(value, "")).strip().lower()
@@ -1058,7 +1114,6 @@ FRAMEWORK = {
     "sql-firewall-wide-open": ("CWE-284", "SQL-"),
     "sql-allow-azure-services": ("CWE-284", "SQL-"),
     "sql-auditing-disabled": ("CWE-778", "SQL-"),
-    "sql-tde-disabled": ("CWE-311", "SQL-"),
     "sql-orphaned-administrator": ("CWE-672", "ID-"),
     "nsg-internet-inbound": ("CWE-284", "NW-"),
     "policy-exemption": ("CWE-693", "GOV-"),
@@ -1074,6 +1129,8 @@ FRAMEWORK = {
     "appservice-ftp-enabled": ("CWE-319", "APP-"),
     "appservice-remote-debug": ("CWE-489", "APP-"),
     "managed-identity-privileged-role": ("CWE-269", "ID-"),
+    "azure-priv-app-owned-by-human": ("CWE-269", "ID-"),
+    "azure-privileged-sp-no-human-owner": ("CWE-693", "ID-"),
     "orphaned-arm-role-assignment": ("CWE-672", "ID-"),
     "orphaned-app-role-assignment": ("CWE-672", "ID-"),
     "backup-soft-delete-off": ("CWE-693", "GOV-"),
@@ -1916,6 +1973,7 @@ def c_storage(ctx):
         " | project name, subscriptionId, publicBlob=tostring(properties.allowBlobPublicAccess),"
         " sharedKey=tostring(properties.allowSharedKeyAccess), tls=tostring(properties.minimumTlsVersion),"
         " crossTenant=tostring(properties.allowCrossTenantReplication), publicNet=tostring(properties.publicNetworkAccess),"
+        " https=tostring(properties.supportsHttpsTrafficOnly),"
         " netDefault=tostring(properties.networkAcls.defaultAction), netBypass=tostring(properties.networkAcls.bypass), ipRules=properties.networkAcls.ipRules"
     )
     rows = arg_rows(q, ctx["subs"])
@@ -1927,6 +1985,8 @@ def c_storage(ctx):
         s = r.get("subscriptionId")
         if r.get("publicBlob") == "true":
             add("high", "storage-public-blob-access", r.get("name"), "allowBlobPublicAccess=true", "anonymous blob read if a container is public", s)
+        if tri(dig(r, "https")) is False:
+            add("high", "storage-http-allowed", dig(r, "name"), "supportsHttpsTrafficOnly=false", "plaintext storage traffic accepted", s)
         if r.get("sharedKey") == "true":
             add("medium", "storage-shared-key-enabled", r.get("name"), "allowSharedKeyAccess=true", "account key bypasses identity control", s)
         tls = str(val(dig(r, "tls"), ""))
@@ -2009,11 +2069,7 @@ def c_sql(ctx):
             deny("sub-sql")
         elif (aud.get("properties") or {}).get("state") != "Enabled":
             add("medium", "sql-auditing-disabled", r.get("name"), "auditingSettings.state != Enabled", "no query audit trail", s)
-        tde = az(["rest", "--url", base + "/transparentDataEncryption/current?api-version=2021-11-01"])
-        if tde is None:
-            deny("sub-sql")
-        elif (tde.get("properties") or {}).get("state") != "Enabled":
-            add("high", "sql-tde-disabled", r.get("name"), "transparentDataEncryption.state != Enabled", "data at rest unprotected", s)
+
 
 
 @check("sub-sql-firewall")
@@ -2033,10 +2089,13 @@ def c_sql_fw(ctx):
         for rule in fw.get("value") or []:
             p = rule.get("properties") or {}
             start, end = str(p.get("startIpAddress")), str(p.get("endIpAddress"))
+            span = address_span(start, end)
             if start in ("0.0.0.0", "0.0.0.1") and end == "0.0.0.0":
                 add("medium", "sql-allow-azure-services", str(dig(r, "name")) + " " + str(dig(rule, "name")), start + "-" + end, "Azure-internal range allowed; sentinel, not internet-wide", r.get("subscriptionId"))
-            elif end == "255.255.255.255":
-                add("high", "sql-firewall-wide-open", str(dig(r, "name")) + " " + str(dig(rule, "name")), start + "-" + end, "public range allowed", r.get("subscriptionId"))
+            elif span_covers_all(start, end):
+                add("high", "sql-firewall-wide-open", str(dig(r, "name")) + " " + str(dig(rule, "name")), start + "-" + end, "the whole address space is admitted", r.get("subscriptionId"))
+            elif span is not None and span[1] - span[0] > 16777215:
+                add("medium", "sql-firewall-range-wide", str(dig(r, "name")) + " " + str(dig(rule, "name")), start + "-" + end, "the range holds more than 16 million addresses", dig(r, "subscriptionId"))
             else:
                 add("low", "sql-firewall-rule", str(dig(r, "name")) + " " + str(dig(rule, "name")), start + "-" + end, "verify the client still exists", r.get("subscriptionId"))
 
@@ -2322,7 +2381,7 @@ def c_defender(ctx):
     for s, items in res.items():
         for p in items or []:
             tier = str((p.get("properties") or {}).get("pricingTier") or "").lower()
-            if tier == "free":
+            if tier == "free" and str(dig(p, "name")).lower() not in DEFENDER_FREE_BY_DESIGN:
                 add("medium", "defender-free-tier", s + " " + str(p.get("name")), "pricingTier=free", "detection disabled for this workload", s)
 
 
@@ -2403,6 +2462,80 @@ def c_mi(ctx):
             add("high", "service-principal-privileged-role", name, "servicePrincipalType=" + kind + " role=" + str(dig(r, "roleId")) + " scope=" + str(dig(r, "scope")), "an application identity can grant access or own resources", sub, str(dig(r, "scope")))
             continue
         add("high", "managed-identity-privileged-role", name, "servicePrincipalType=" + (kind or "unknown") + " role=" + str(dig(r, "roleId")) + " scope=" + str(dig(r, "scope")), "machine identity can grant access or own resources", sub, str(dig(r, "scope")))
+
+
+@check("sub-azure-takeover")
+def c_azure_takeover(ctx):
+    """Human ownership of an identity that holds Owner or User Access Administrator.
+
+    The Azure counterpart of the app-permission takeover path: the grant comes from
+    Azure RBAC, not from an application permission, so it is read from role
+    assignments and resolved through the directory object behind the principal.
+    """
+    q = (
+        "AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments'"
+        " | where subscriptionId in (" + subq(ctx["subs"]) + ")"
+        " | where tostring(properties.principalType) == 'ServicePrincipal'"
+        " | where (tostring(properties.roleDefinitionId) endswith '" + BUILTIN_ROLE_OWNER + "'"
+        " or tostring(properties.roleDefinitionId) endswith '" + BUILTIN_ROLE_UAA + "')"
+        " | project principalId=tostring(properties.principalId), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope)"
+    )
+    rows = arg_rows(q, ctx["subs"], scoped=False)
+    if rows is None:
+        note("sub-azure-takeover", 0, denied=1)
+        return
+    note("sub-azure-takeover", len(rows))
+    holders = defaultdict(list)
+    for r in rows:
+        holders[str(dig(r, "principalId"))].append(r)
+    sample("sub-azure-takeover", min(len(holders), 25), len(holders), "control-plane identities")
+    taken = 0
+    for pid in sorted(holders)[:25]:
+        first = holders[pid][0]
+        sub = ctx_sub(first)
+        scopes = sorted({str(dig(r, "scope")) for r in holders[pid]})
+        scope = scopes[0] if scopes else "tenant"
+        sp = graph("servicePrincipals/" + pid + "?$select=id,displayName,appId,servicePrincipalType")
+        if sp is None:
+            if az_kind() != "absent":
+                denied_now("sub-azure-takeover")
+                add("info", "app-owner-takeover-unassessed", pid, "control-plane role holder unreadable scope=" + scope[:60], "the identity behind this Azure role assignment was not resolved", sub, scope)
+            continue
+        kind = str(val(dig(sp, "servicePrincipalType"), ""))
+        name = str(val(dig(sp, "displayName"), pid))
+        if kind == "ManagedIdentity":
+            continue
+        if not kind:
+            add("info", "app-owner-takeover-unassessed", name, "servicePrincipalType not returned scope=" + scope[:60], "a workload identity holds control-plane access; ownership was not assessed", sub, scope)
+            continue
+        app_id = str(val(dig(sp, "appId"), ""))
+        sources = [("servicePrincipal", "servicePrincipals/" + pid + "/owners?$select=id,userPrincipalName")]
+        if app_id:
+            sources.append(("application", "applications(appId='" + app_id + "')/owners?$select=id,userPrincipalName"))
+        owned = False
+        for via, path in sources:
+            owners = graph(path)
+            if owners is None:
+                if az_kind() != "absent":
+                    denied_now("sub-azure-takeover")
+                    add("info", "app-owner-takeover-unassessed", name, via + " owners unreadable scope=" + scope[:60], "owners of this control-plane identity were not assessed", sub, scope)
+                continue
+            humans = [u for u in (str(val(dig(o, "userPrincipalName"), "")) for o in lst(dig(owners, "value"))) if u]
+            if not humans:
+                continue
+            owned = True
+            taken += 1
+            add("high", "azure-priv-app-owned-by-human", name,
+                "via=" + via + " owners=" + ",".join(humans[:3]) + " role=" + str(dig(first, "roleId")).split("/")[-1] + " scope=" + scope[:60],
+                "an owner can add a credential and act with this identity's control-plane role", sub, scope)
+            chain("owner-to-azure-control-plane",
+                  "user " + humans[0] + " -> owns " + name + " (" + pid[:8] + ") -> Owner on " + scope[:60],
+                  "high", "credential injection reaches the Azure control plane")
+            break
+        if not owned and az_kind() == "absent":
+            add("info", "app-owner-takeover-unassessed", name, "no owner list reachable scope=" + scope[:60], "the identity is not owned from this directory; ownership sits in its publisher tenant", sub, scope)
+    if holders and not taken:
+        add("info", "azure-privileged-sp-no-human-owner", "tenant", "holders=" + str(len(holders)) + " humanOwned=0", "no control-plane identity has a human owner; credential custody is not person-linked")
 
 
 @check("sub-public-ips")
@@ -2968,6 +3101,29 @@ def _strengths():
     return out
 
 
+BREAKGLASS_TOKENS = ("break", "breakglass", "emergency", "notfall", "sos", "fallback")
+
+
+def breakglass_ids(ctx):
+    """User ids whose display name marks them as an emergency access account.
+
+    Microsoft's guidance is to exclude these accounts from every conditional access
+    policy, so an exclusion that resolves to one of them is the intended state, not
+    a bypass.
+    """
+    idx = ctx["idx"]
+    try:
+        users = idx.users()
+    except DatasetUnavailable:
+        return None
+    out = set()
+    for u in users:
+        name = str(dig(idx.props(u), "displayName") or "").lower()
+        if any(re.search(r"\b" + token + r"\b", name) for token in BREAKGLASS_TOKENS):
+            out.add(str(dig(u, "id")))
+    return out
+
+
 @check("entra-ca")
 def c_ca(ctx):
     scan_dynamic(ctx)
@@ -2982,6 +3138,9 @@ def c_ca(ctx):
     has_frequency = False
     has_risk = False
     requires_device = False
+    emergency = breakglass_ids(ctx)
+    if emergency is None:
+        undecided("ca-exclusion-unclassified", "emergency account set unknown", "an exclusion cannot be classified as intended or as a bypass")
     for p in pols:
         state = p.get("state")
         enforced = state == "enabled"
@@ -3001,8 +3160,12 @@ def c_ca(ctx):
                 add(sev, "ca-exclusion-dynamic-group", name, "excludeGroups includes " + glabel + " steer=" + steer, "rule-based membership removes the control")
                 if sev == "high":
                     chain("attribute-to-ca-bypass", STEER_LABEL[steer] + " -> " + group_node(ctx, gid) + " -> excluded from " + str(name), sev, "join the group, skip the policy")
-        if state == "enabled" and (users.get("excludeGroups") or users.get("excludeUsers")):
-            add("low", "ca-policy-has-exclusions", name, "excludeGroups=" + str(len(users.get("excludeGroups") or [])) + " excludeUsers=" + str(len(users.get("excludeUsers") or [])), "exclusions are the bypass surface")
+        if state == "enabled":
+            ex_groups = lst(dig(users, "excludeGroups"))
+            ex_roles = lst(dig(users, "excludeRoles"))
+            kept = [str(u) for u in lst(dig(users, "excludeUsers")) if emergency is None or str(u) not in emergency]
+            if ex_groups or ex_roles or kept:
+                add("low", "ca-policy-has-exclusions", name, "excludeGroups=" + str(len(ex_groups)) + " excludeUsers=" + str(len(kept)) + " excludeRoles=" + str(len(ex_roles)), "exclusions beyond the emergency accounts are the bypass surface")
         flows = cond.get("authenticationFlows") or {}
         raw_methods = dig(flows, "transferMethods")
         methods = [str(x) for x in lst(raw_methods)] if isinstance(raw_methods, list) else ([str(raw_methods)] if raw_methods not in (MISSING, None, "") else [])
@@ -3048,9 +3211,21 @@ def c_ca(ctx):
     if pols and ca_complete() and not has_frequency:
         add("medium", "ca-no-signin-frequency", "tenant", "no sessionControls.signInFrequency", "stolen tokens stay valid for their full lifetime")
     if pols and ca_complete() and not has_risk:
-        add("medium", "ca-no-risk-conditions", "tenant", "no signInRiskLevels or userRiskLevels", "no risk-based response; requires P2")
+        p2 = licensed(["AAD_PREMIUM_P2"])
+        if p2 is None:
+            undecided("ca-licence-unread", "risk conditions absent; licence unread", "whether the tenant can use risk-based policies was not decided")
+        elif p2:
+            add("medium", "ca-no-risk-conditions", "tenant", "no signInRiskLevels or userRiskLevels", "no risk-based response; requires P2")
+        else:
+            add("info", "ca-risk-not-licensed", "tenant", "no AAD_PREMIUM_P2 service plan", "risk-based conditional access needs P2; its absence is expected here")
     if pols and ca_complete() and not requires_device:
-        add("medium", "ca-no-device-requirement", "tenant", "no policy requires compliant or joined device", "device trust is not an access condition")
+        intune = licensed(["INTUNE_A"])
+        if intune is None:
+            undecided("ca-licence-unread", "device requirement absent; licence unread", "whether the tenant can enforce device compliance was not decided")
+        elif intune:
+            add("medium", "ca-no-device-requirement", "tenant", "no policy requires compliant or joined device", "device trust is not an access condition")
+        else:
+            add("info", "ca-device-not-licensed", "tenant", "no INTUNE_A service plan", "device compliance needs Intune; its absence is expected here")
     for p in pols:
         for action in ((p.get("conditions") or {}).get("userActions") or []):
             if action in ("urn:user:registersecurityinfo", "urn:user:registerdevice"):
@@ -3544,10 +3719,10 @@ def c_breakglass(ctx):
     named = []
     for u in idx.users():
         p = idx.props(u)
-        name = str(p.get("displayName") or "").lower()
-        if u.get("id") in excluded:
+        name = str(dig(p, "displayName") or "").lower()
+        if str(dig(u, "id")) in excluded:
             named.append(u)
-        if any(t in name for t in ("break", "emergency", "notfall", "sos", "fallback")):
+        if any(re.search(r"\b" + token + r"\b", name) for token in BREAKGLASS_TOKENS):
             candidates.append(u)
     if not candidates and named:
         candidates = named
@@ -3557,6 +3732,8 @@ def c_breakglass(ctx):
             add("medium", "no-breakglass-account", "tenant", "0 accounts matching emergency naming in the dataset", "recovery depends on an undocumented account")
         else:
             add("info", "breakglass-not-assessed", "tenant", "no user objects in the dataset", "emergency account detection needs user data")
+    elif len(candidates) == 1:
+        add("medium", "breakglass-single-account", "tenant", "accounts=1 name=" + str(dig(idx.props(candidates[0]), "displayName"))[:40], "one emergency account is a single point of failure; Microsoft recommends two")
     for u in candidates:
         p = idx.props(u)
         synced = tri(dig(p, "onPremisesSyncEnabled"))
@@ -3564,8 +3741,10 @@ def c_breakglass(ctx):
         ex = u.get("id") in excluded
         shown_cloud = "unknown" if synced is None else str(cloud)
         add("info", "breakglass-account", dig(p, "displayName"), "cloudOnly=" + shown_cloud + " caExcluded=" + str(ex) + " enabled=" + str(dig(p, "accountEnabled")), "verify credential custody and alerting")
-        if ex and cloud:
-            add("low", "breakglass-ca-excluded", p.get("displayName"), "excludedFromAtLeastOneEnabledPolicy", "an unmonitored path around that policy if the credential leaks")
+        if not ex:
+            add("high", "breakglass-not-excluded", dig(p, "displayName"), "excludedFromNoEnabledPolicy", "an emergency account that no policy exempts can be locked out by the policy itself")
+        elif cloud:
+            add("low", "breakglass-ca-excluded", dig(p, "displayName"), "excludedFromAtLeastOneEnabledPolicy", "an unmonitored path around that policy if the credential leaks")
 
 
 @check("entra-ca-roles")
@@ -6828,7 +7007,7 @@ def c_aks_wi(ctx):
             add("low", "aks-api-public", r.get("name"), "privateFQDN absent", "API server name resolves publicly", s)
 
 
-GRAPH_SUB_CHECKS = ("sub-orphans", "sub-approle-orphans", "sub-arm-orphans", "sub-sql-orphans", "sub-guest-rbac", "sub-rbac-write", "sub-managed-identities")
+GRAPH_SUB_CHECKS = ("sub-orphans", "sub-approle-orphans", "sub-arm-orphans", "sub-sql-orphans", "sub-guest-rbac", "sub-rbac-write", "sub-managed-identities", "sub-azure-takeover")
 
 
 @check("entra-ca-scope-detail")
@@ -10356,7 +10535,7 @@ def lint(path=None):
         if grew:
             for n, now, before in grew[:10]:
                 failures.append("lint regression in %s: %d > %d" % (n, now, before))
-        if total < allowed or per != allowed_per:
+        if not grew and (total < allowed or per != allowed_per):
             _write_baseline(baseline, total, per)
             print("lint baseline tightened: " + str(allowed) + " -> " + str(total))
     if failures:
@@ -10595,17 +10774,17 @@ def main():
         c = Counter({sev: by_sub[(key, sev)] for sev in SEV if by_sub[(key, sev)]})
         print("%-40s %5d %5d %6d %5d %7s" % (s, c.get("critical", 0), c.get("high", 0), c.get("medium", 0), c.get("low", 0), inv.get(key, "-")))
 
-    print("\n=== findings ===")
-    print("%-9s %3s %-14s %-32s %-32s %s" % ("SEV", "SCR", "SUBSCRIPTION", "CHECK", "SUBJECT", "EVIDENCE"))
-    for f in out:
-        print("%-9s %3s %-14s %-32s %-32s %s" % (f["severity"], f["score"], str(f["subscription"])[:14], f["check"][:32], str(f["subject"])[:32], f["evidence"][:70]))
-
     if chain_rows:
         print("\n=== chains ===")
         print("chains: " + str(len(chain_rows)) + "; each id is repeated in the findings below")
         for row in chain_rows:
             c = row["chain"]
             print(row["id"] + " " + c["severity"] + " " + c["chain"] + " [" + str(c["source"]) + "]: " + c["path"])
+
+    print("\n=== findings ===")
+    print("%-9s %3s %-14s %-32s %-32s %s" % ("SEV", "SCR", "SUBSCRIPTION", "CHECK", "SUBJECT", "EVIDENCE"))
+    for f in out:
+        print("%-9s %3s %-14s %-32s %-32s %s" % (f["severity"], f["score"], str(f["subscription"])[:14], f["check"][:32], str(f["subject"])[:32], f["evidence"][:70]))
 
 
     lines = []

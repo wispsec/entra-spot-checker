@@ -9,7 +9,7 @@ self-test ships next to it.
 
 ## What it does
 
-- Runs 314 checks against Azure Resource Graph, the ARM REST API, and Microsoft
+- Runs 315 checks against Azure Resource Graph, the ARM REST API, and Microsoft
   Graph.
 - Reads an AzureHound export for identity objects that Graph access does not
   reach.
@@ -92,8 +92,8 @@ Report sections, in order:
 5. `coverage` — per check: status, examined, denied.
 6. `blind spots` — checks that did not complete cleanly, with the reason.
 7. `by subscription` — severity counts and resource totals.
-8. `findings` — one line per finding.
-9. `chains` — one line per chain: id, severity, name, owning check, path.
+8. `chains` — one line per chain: id, severity, name, owning check, path.
+9. `findings` — one line per finding.
 10. Per-finding detail blocks grouped by subscription. A block lists the chain
     ids its check produced in a `chains` line.
 11. `attack chains` — one block per chain: id, severity, name, owning check,

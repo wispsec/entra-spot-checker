@@ -1,4 +1,4 @@
-total 1338
+total 1325
 check entra-admin-unit-scope 5
 check entra-agent-identities 1
 check entra-api-scopes 7
@@ -17,8 +17,8 @@ check entra-auth-methods-detail 19
 check entra-auth-methods-policy 12
 check entra-authenticator-features 5
 check entra-authorization-policy 13
-check entra-breakglass 9
-check entra-ca 44
+check entra-breakglass 6
+check entra-ca 38
 check entra-ca-inventory 15
 check entra-ca-matrix 5
 check entra-ca-roles 6
@@ -157,7 +157,7 @@ check sub-rbac-scope-breadth 4
 check sub-rbac-write 5
 check sub-resource-diagnostics 15
 check sub-sentinel-depth 2
-check sub-sql 20
+check sub-sql 16
 check sub-sql-advanced 23
 check sub-sql-databases 15
 check sub-sql-firewall 12

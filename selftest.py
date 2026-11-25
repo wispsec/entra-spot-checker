@@ -317,6 +317,30 @@ def regressions():
     assert "entra-peer-tenant-privilege" in M.TRUNC_CHECKS
     M.TRUNCATED.clear()
     reset()
+    # An exclusion that resolves to an emergency account is the intended state.
+    bg_idx = M.Index([{"kind": "AZUser", "id": "bg1", "properties": {"displayName": "Break Glass"}},
+                      {"kind": "AZUser", "id": "u1", "properties": {"displayName": "User One"}}], "ok")
+
+    def ca_excl(excl):
+        return [{"state": "enabled", "displayName": "p",
+                 "conditions": {"users": {"includeUsers": ["All"], "excludeUsers": excl},
+                                "applications": {"includeApplications": ["All"]}},
+                 "grantControls": {"builtInControls": ["mfa"]}}]
+
+    got = _run("entra-ca", {"subs": [], "idx": bg_idx, "dynamic": set()}, ca_all=lambda *a, **k: ca_excl(["bg1"]),
+               scan_dynamic=lambda c: None, graph_all=lambda *a, **k: [], licensed=lambda plans: False)
+    assert "ca-policy-has-exclusions" not in got, got
+    assert "ca-risk-not-licensed" in got and "ca-no-risk-conditions" not in got, got
+    got = _run("entra-ca", {"subs": [], "idx": bg_idx, "dynamic": set()}, ca_all=lambda *a, **k: ca_excl(["u1"]),
+               scan_dynamic=lambda c: None, graph_all=lambda *a, **k: [], licensed=lambda plans: True)
+    assert "ca-policy-has-exclusions" in got, got
+    assert "ca-no-risk-conditions" in got and "ca-risk-not-licensed" not in got, got
+    # One emergency account is a single point of failure; a named account no policy exempts is high.
+    got = _run("entra-breakglass", {"subs": [], "idx": bg_idx, "dynamic": set()}, ca_all=lambda *a, **k: ca_excl(["bg1"]))
+    assert "breakglass-single-account" in got, got
+    got = _run("entra-breakglass", {"subs": [], "idx": bg_idx, "dynamic": set()}, ca_all=lambda *a, **k: ca_excl(["u1"]))
+    assert "breakglass-not-excluded" in got, got
+    reset()
 
 
 def fail_all():
