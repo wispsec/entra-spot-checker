@@ -5109,12 +5109,13 @@ def c_custom_arm(ctx):
         perms = lst(dig(r, "perms"))
         grants = [t for t in ("microsoft.authorization/roleassignments/write", "microsoft.authorization/roledefinitions/write", "microsoft.authorization/elevateAccess/action") if any(permits(p, t) for p in perms)]
         danger = [t for t in DANGEROUS_ACTIONS if any(permits(p, t) for p in perms)]
+        where = str(dig(r, "subscriptionId")) or "tenant"
         if grants:
-            add("high", "custom-role-privilege-grant", dig(r, "name"), "actions=" + ",".join(grants[:3]), "the custom role can grant access or assign identities", str(dig(r, "subscriptionId")))
+            add("high", "custom-role-privilege-grant", dig(r, "name"), "actions=" + ",".join(grants[:3]), "the custom role can grant access or assign identities", where)
         elif danger:
-            add("high", "custom-role-privilege-grant", dig(r, "name"), "actions=" + ",".join(danger[:3]), "custom role holds a dangerous action", str(dig(r, "subscriptionId")))
+            add("high", "custom-role-privilege-grant", dig(r, "name"), "actions=" + ",".join(danger[:3]), "custom role holds a dangerous action", where)
         elif not perms:
-            add("low", "custom-role-no-permissions", dig(r, "name"), "permissions empty", "the role definition grants nothing", str(dig(r, "subscriptionId")))
+            add("low", "custom-role-no-permissions", dig(r, "name"), "permissions empty", "the role definition grants nothing", where)
 
 
 @check("sub-deny-assignments")
@@ -6617,7 +6618,9 @@ def c_review_scope(ctx):
     for r in rows:
         scope = dig(r, "scope")
         enumeration = dig(r, "instanceEnumerationScope")
-        target = str(val(dig(scope, "query"), "")) or str(val(dig(enumeration, "query"), ""))
+        own = str(val(dig(scope, "query"), ""))
+        parent = str(val(dig(enumeration, "query"), ""))
+        target = own if own.startswith("/") else (parent or own)
         if not target:
             add("low", "access-review-scope-unreadable", str(val(dig(r, "displayName"), "review")), "scope object not returned", "the reviewed object type cannot be confirmed")
             continue
@@ -7136,7 +7139,7 @@ def c_rbac_breadth(ctx):
     for r in rows:
         sc = str(r.get("scope") or "")
         if "/resourceGroups/" in sc and "/providers/" in sc:
-            add("low", "rbac-resource-scope", str(r.get("principalId")), "scope=" + sc, "a per-resource assignment; review whether it is still needed", r.get("subscriptionId"))
+            add("low", "rbac-resource-scope", str(r.get("principalId")), "scope=" + sc, "a per-resource assignment; review whether it is still needed", ctx_sub(r))
 
 
 @check("entra-app-publisher")
@@ -8427,10 +8430,10 @@ def c_security_settings(ctx):
         note("sub-security-settings", 0, denied=1)
         return
     note("sub-security-settings", len(rows))
-    per_sub = defaultdict(set)
+    by_sub = defaultdict(set)
     for r in rows:
-        per_sub[str(val(dig(r, "subscriptionId"), ""))].add(str(dig(r, "name")).lower())
-    for s, seen in per_sub.items():
+        by_sub[str(val(dig(r, "subscriptionId"), ""))].add(str(dig(r, "name")).lower())
+    for s, seen in by_sub.items():
         for required in ("wdatp", "mcas", "sentinel"):
             if required not in seen:
                 add("low", "security-setting-absent", required, "0 settings named " + required + " subscription=" + s, "the integration is not configured for this subscription", s)
@@ -9002,7 +9005,7 @@ def c_reviews_rbac(ctx):
         add("medium", "no-azure-access-review", "all", "0 schedules", "Azure RBAC assignments are never reviewed")
     for r in rows:
         if tri(dig(r, "auto")) is not True:
-            add("low", "access-review-no-autoapply", str(dig(r, "name")), "autoApplyDecisionsEnabled=false", "review results do not change access", str(dig(r, "subscriptionId")))
+            add("low", "access-review-no-autoapply", str(dig(r, "name")), "autoApplyDecisionsEnabled=false", "review results do not change access", ctx_sub(r))
 
 
 @check("sub-publicip-sku")
@@ -9627,7 +9630,7 @@ def c_policy_params(ctx):
         return
     note("sub-policy-parameter-effect", len(rows))
     for r in rows:
-        s = str(dig(r, "subscriptionId"))
+        s = ctx_sub(r)
         effect = str(val(dig(r, "effect"), "")).lower()
         if effect in ("audit", "auditifnotexists", "disabled"):
             add("medium", "policy-parameter-weak-effect", dig(r, "name"), "parameters.effect=" + effect, "the assignment reports but does not prevent the condition", s)
@@ -9986,10 +9989,13 @@ def c_xtenant_escalation(ctx):
     inherited_inbound = str(val(dig(default_policy, "b2bCollaborationInbound.usersAndGroups.accessType"), "")).lower()
     if default_policy is None:
         deny("entra-cross-tenant-escalation")
+        undecided("cross-tenant-inbound-unread", "default cross-tenant policy unread", "an unset partner inbound inherits this policy, so trust bypass is not decided")
     trusted = []
     for p in lst(partners):
         tid = str(val(dig(p, "tenantId"), ""))
         inbound = str(val(dig(p, "b2bCollaborationInbound.usersAndGroups.accessType"), "")).lower() or inherited_inbound
+        if not inbound:
+            continue
         mfa = tri(dig(p, "inboundTrust.isMfaAccepted")) is True
         device = tri(dig(p, "inboundTrust.isCompliantDeviceAccepted")) is True or tri(dig(p, "inboundTrust.isHybridAzureADJoinedDeviceAccepted")) is True
         if (mfa or device) and inbound != "blocked":
@@ -10447,16 +10453,15 @@ def c_breakglass_hardening(ctx):
         name = str(val(dig(doc, "userPrincipalName"), pid))
         label = str(val(dig(doc, "displayName"), pid))
         excluded_by = exclude_counts.get(pid, 0)
-        if not excluded_known:
-            add("info", "breakglass-exclusion-unread", name, "conditional access policies unread", "whether this account is excluded from enforced policies was not assessed")
-        elif not enabled_policies:
-            add("info", "breakglass-exclusion-not-applicable", name, "enabledPolicies=0", "no enforced policy exists, so an emergency exclusion cannot be configured")
-        elif excluded_by and excluded_by == enabled_policies:
-            add("info", "breakglass-excluded", name, "excludedFromAtLeastOneEnabledPolicy=true excludedFrom=" + str(excluded_by) + "/" + str(enabled_policies), "this administrator bypasses every enforced policy")
-        elif excluded_by:
-            add("medium", "breakglass-excluded-from-some-policies", name, "excludedFrom=" + str(excluded_by) + "/" + str(enabled_policies), "the emergency account still meets the remaining policies; a lost factor can lock it out")
-        else:
-            add("high", "breakglass-not-excluded", name, "excludedFromAtLeastOneEnabledPolicy=false policies=" + str(enabled_policies), "no emergency path: a broken policy or a lost factor locks this administrator out")
+        if excluded_known:
+            if not enabled_policies:
+                add("info", "breakglass-exclusion-not-applicable", name, "enabledPolicies=0", "no enforced policy exists, so an emergency exclusion cannot be configured")
+            elif excluded_by and excluded_by == enabled_policies:
+                add("info", "breakglass-excluded", name, "excludedFromAtLeastOneEnabledPolicy=true excludedFrom=" + str(excluded_by) + "/" + str(enabled_policies), "this administrator bypasses every enforced policy")
+            elif excluded_by:
+                add("medium", "breakglass-excluded-from-some-policies", name, "excludedFrom=" + str(excluded_by) + "/" + str(enabled_policies), "the emergency account still meets the remaining policies; a lost factor can lock it out")
+            else:
+                add("high", "breakglass-not-excluded", name, "excludedFromAtLeastOneEnabledPolicy=false policies=" + str(enabled_policies), "no emergency path: a broken policy or a lost factor locks this administrator out")
         if dig(doc, "onPremisesImmutableId"):
             add("medium", "breakglass-synced", name, "onPremisesImmutableId=" + str(dig(doc, "onPremisesImmutableId")), "the emergency account depends on the on-premises directory it is meant to survive")
         if lst(dig(doc, "assignedLicenses")):

@@ -1,4 +1,4 @@
-total 1310
+total 1309
 check entra-admin-unit-scope 5
 check entra-agent-identities 1
 check entra-api-scopes 7
@@ -153,7 +153,7 @@ check sub-private-dns 7
 check sub-private-endpoints 7
 check sub-privileged-roles 9
 check sub-public-ips 4
-check sub-rbac-scope-breadth 4
+check sub-rbac-scope-breadth 3
 check sub-rbac-write 5
 check sub-resource-diagnostics 15
 check sub-sentinel-depth 2
