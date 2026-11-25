@@ -132,7 +132,7 @@ attribution behind.
 
 | Gate | Rejects |
 |---|---|
-| Construct budget | A banned construct, per check and in total. |
+| Construct budget | A banned construct, per check and in total: `.get("`, `or []`, `az(["rest"`, `DENIED[`, `== "false"`, `!= "true"`. |
 | Check identity | A `note()` or `deny()` name that is not a registered check. |
 | Failed reads | `if X is None: X = []` after a transport call, `lst(<read>)`, `<read> or []`, including on a local name that holds the result. |
 | Scope declaration | A `scoped=False` query with no `subscriptionId` predicate, not wrapped in `tenant_wide()` or `filtered_in_python()`. |
