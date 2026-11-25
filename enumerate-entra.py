@@ -8122,7 +8122,13 @@ def c_adf(ctx):
 
 @check("sub-datacollection")
 def c_dcr(ctx):
-    rows = arg_rows("Resources | where type =~ 'microsoft.insights/datacollectionrules' | project name, subscriptionId, ident=tostring(identity.type), kind=tostring(properties.dataSources)", ctx["subs"])
+    q = (
+        "Resources | where type =~ 'microsoft.insights/datacollectionrules'"
+        " | extend ident=tostring(identity.type)"
+        " | mv-apply d = properties.dataSources on (summarize syslog=countif(tolower(tostring(d.kind)) == 'syslog'))"
+        " | project name, subscriptionId, ident, syslog"
+    )
+    rows = arg_rows(q, ctx["subs"])
     if rows is None:
         note("sub-datacollection", 0, denied=1)
         return
@@ -8131,8 +8137,8 @@ def c_dcr(ctx):
         name = str(dig(r, "name"))
         if not dig(r, "ident"):
             add("low", "dcr-no-identity", name, "identity.type=none", "the rule writes to a workspace without its own identity", str(dig(r, "subscriptionId")))
-        if "syslog" in str(dig(r, "kind")).lower():
-            add("info", "dcr-syslog", name, "agent-based ingestion", "syslog collection widens the log injection surface", str(dig(r, "subscriptionId")))
+        if dig(r, "syslog"):
+            add("info", "dcr-syslog", name, "syslogDataSources=" + str(dig(r, "syslog")), "syslog collection widens the log injection surface", str(dig(r, "subscriptionId")))
 
 
 @check("sub-security-settings")
