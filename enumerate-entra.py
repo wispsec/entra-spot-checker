@@ -4450,11 +4450,10 @@ def c_sp_dormant(ctx):
     note("entra-sp-dormant", len(rows))
     cutoff = time.time() - 90 * 86400
     for r in rows:
-        last = dig(r, "lastSignInActivity")
-        ts = str(val(dig(last, "lastSignInDateTime"), ""))
-        app_ts = str(val(dig(r, "appOnlyLastSignInActivity.lastSignInDateTime"), ""))
-        newest = max(_stamp(ts) or 0.0, _stamp(app_ts) or 0.0)
-        if not newest:
+        newest, carried = newest_signin(r)
+        if not carried:
+            add("info", "sp-signin-activity-unknown", dig(r, "appId"), "no sign-in activity field returned", "whether this principal authenticates could not be determined")
+        elif not newest:
             add("low", "sp-never-signed-in", dig(r, "appId"), "no delegated or app-only signInActivity", "the principal holds permissions but never authenticates")
         elif newest < cutoff:
             add("low", "sp-unused", dig(r, "appId"), "lastSignIn=" + _iso(newest), "app unused for 90 days; candidate for removal")
@@ -5484,16 +5483,52 @@ def uri_host(value):
 
 
 def thumbprint_of(value):
-    """Hex SHA-1 from a keyCredential customKeyIdentifier, which the API returns in base64."""
+    """Hex SHA-1 from a keyCredential customKeyIdentifier.
+
+    The endpoint returns base64; some tooling writes hex, with or without
+    separators. Hex is a valid base64 alphabet, so it is recognised before the
+    decode or it decodes to noise.
+    """
     raw = str(val(value, "")).strip()
     if not raw:
         return ""
-    if re.fullmatch(r"[0-9a-fA-F]{40}", raw):
-        return raw.lower()
+    compact = raw.replace(":", "").replace(" ", "").lower()
+    if re.fullmatch(r"[0-9a-f]{40}", compact):
+        return compact
     try:
         return base64.b64decode(raw, validate=True).hex()
     except (ValueError, TypeError):
         return ""
+
+
+SIGNIN_ACTIVITY_PATHS = (
+    "lastSignInActivity.lastSignInDateTime",
+    "appOnlyLastSignInActivity.lastSignInDateTime",
+    "applicationAuthenticationClientSignInActivity.lastSignInDateTime",
+    "delegatedClientSignInActivity.lastSignInDateTime",
+)
+
+PHISHING_RESISTANT_METHODS = (
+    "fido2AuthenticationMethod",
+    "windowsHelloForBusinessAuthenticationMethod",
+    "x509CertificateAuthenticationMethod",
+    "x509CertificateMultiFactorAuthenticationMethod",
+    "platformCredentialAuthenticationMethod",
+    "passkeyDeviceBoundAuthenticator",
+)
+
+
+def newest_signin(row):
+    """(newest sign-in timestamp, whether the row carried any activity field)."""
+    carried = False
+    newest = 0.0
+    for path in SIGNIN_ACTIVITY_PATHS:
+        found = dig(row, path)
+        if found is MISSING:
+            continue
+        carried = True
+        newest = max(newest, _stamp(str(val(found, ""))) or 0.0)
+    return newest, carried
 
 
 @check("entra-app-identifiers")
@@ -6031,7 +6066,7 @@ def c_peruser_mfa(ctx):
             denied_now("entra-per-user-mfa-methods")
             continue
         methods = [str(dig(m, "@odata.type") or "").split(".")[-1] for m in lst(dig(doc, "value"))]
-        strong = [m for m in methods if m in ("fido2AuthenticationMethod", "windowsHelloForBusinessAuthenticationMethod")]
+        strong = [m for m in methods if m in PHISHING_RESISTANT_METHODS]
         if not strong:
             add("medium", "no-phishing-resistant-method-sampled", dig(u, "userPrincipalName"), "methods=" + ",".join(methods)[:60], "MFA relies on OTP, SMS or password only")
     sample("entra-per-user-mfa-methods", min(len(users), 15), len(users), "users")
@@ -7125,7 +7160,7 @@ def c_mfa_baseline(ctx):
         sid = dig(gc, "authenticationStrength.id")
         entry = dig(strengths, str(sid)) if sid and strengths is not None else None
         combos = [str(c).lower() for c in (entry[1] if isinstance(entry, tuple) and len(entry) > 1 else [])]
-        multi = ("password,microsoftauthenticatorpush", "fido2", "windowshelloforbusiness", "x509certificatemultifactor", "microsoftauthenticatorpush", "softwareoath", "temporaryaccesspass")
+        multi = ("password,microsoftauthenticatorpush", "fido2", "windowshelloforbusiness", "x509certificatemultifactor", "microsoftauthenticatorpush", "softwareoath", "temporaryaccesspass", "platformcredential", "passkey")
         strength_ok = bool(sid) and any(any(t in c for t in multi) and "singlefactor" not in c for c in combos)
         holes = len(lst(dig(users, "excludeUsers"))) + len(lst(dig(users, "excludeGroups"))) + len(lst(dig(users, "excludeRoles"))) + len(lst(dig(apps, "excludeApplications")))
         if all_users and all_apps and (("mfa" in controls) or strength_ok):
@@ -7440,7 +7475,7 @@ def c_saml_config(ctx):
             add("high", "saml-relay-state-plaintext", label, "relayState=" + relay[:60], "assertion posted over plaintext HTTP")
         if not lst(dig(sp, "notificationEmailAddresses")):
             add("low", "saml-no-cert-contacts", label, "notificationEmailAddresses empty", "certificate expiry warnings have no recipient")
-        thumb = str(val(dig(sp, "preferredTokenSigningKeyThumbprint"), "")).replace(" ", "").lower()
+        thumb = str(val(dig(sp, "preferredTokenSigningKeyThumbprint"), "")).replace(" ", "").replace(":", "").lower()
         if not thumb:
             add("medium", "saml-no-pinned-key", label, "preferredTokenSigningKeyThumbprint unset", "either signing certificate is accepted; rotation can be hijacked")
         else:
@@ -8492,7 +8527,7 @@ def c_managed_devices(ctx):
         name = str(dig(d, "deviceName"))
         if dig(d, "isEncrypted") is False:
             add("medium", "device-not-encrypted", name, "os=" + str(dig(d, "operatingSystem")) + " compliance=" + str(dig(d, "complianceState")), "managed device stores data unencrypted")
-        if str(dig(d, "jailBroken") or "").lower() not in ("", "unknown", "false"):
+        if str(dig(d, "jailBroken") or "").strip().lower() in ("true", "yes", "1"):
             add("high", "device-jailbroken", name, "jailBroken=" + str(dig(d, "jailBroken")), "managed device is rooted or jailbroken")
         if str(dig(d, "complianceState") or "").lower() in ("noncompliant", "error", "conflict"):
             add("medium", "device-noncompliant", name, "complianceState=" + str(dig(d, "complianceState")), "managed device does not meet policy")
@@ -10804,7 +10839,7 @@ def c_breakglass_hardening(ctx):
             denied_now("entra-breakglass-hardening")
             continue
         kinds = [str(dig(m, "@odata.type") or "").split(".")[-1] for m in lst(dig(methods, "value"))]
-        strong = [k for k in kinds if k in ("fido2AuthenticationMethod", "windowsHelloForBusinessAuthenticationMethod", "x509CertificateAuthenticationMethod")]
+        strong = [k for k in kinds if k in PHISHING_RESISTANT_METHODS]
         if not strong:
             add("high", "breakglass-no-strong-method", label, "methods=" + (",".join(kinds)[:70] or "none"), "the emergency path has no phishing-resistant factor")
     if not holders:

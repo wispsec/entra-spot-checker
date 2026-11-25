@@ -592,6 +592,7 @@ def payloads():
     ga = "62e90394-69f5-4237-9190-012177145e10"
     owner = "/providers/microsoft.authorization/roledefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
     HEX40 = "aa" * 20
+    COLON_THUMB = ":".join(HEX40[i:i + 2] for i in range(0, 40, 2)).upper()
     QUERIES = []
 
     def RECORD(tag, value):
@@ -938,6 +939,26 @@ def payloads():
           "az": lambda *a, **k: {"value": [{"name": "r", "properties": {
               "startIpAddress": "10.0.0.0", "endIpAddress": "10.255.255.255"}}]}},
          ("sql-firewall-range-wide",), ("sql-firewall-rule",), None),
+        ("an activity field under a newer name still counts as activity", "entra-sp-dormant", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"appId": "a1", "delegatedClientSignInActivity": {
+             "lastSignInDateTime": "2999-01-01T00:00:00Z"}}]},
+         (), ("sp-never-signed-in",), None),
+        ("a principal with no activity field is not a never-used principal", "entra-sp-dormant", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"appId": "a1"}]},
+         ("sp-signin-activity-unknown",), ("sp-never-signed-in", "sp-unused"), None),
+        ("a remediated jailbreak is not a jailbroken device", "entra-managed-devices", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"deviceName": "d1", "isEncrypted": True, "jailBroken": "Remediated",
+                                         "complianceState": "compliant", "operatingSystem": "iOS"}]},
+         (), ("device-jailbroken",), None),
+        ("a platform credential is phishing resistant", "entra-per-user-mfa-methods", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"id": "u1", "userPrincipalName": "u@x"}],
+          "graph": lambda *a, **k: {"value": [{"@odata.type": "#microsoft.graph.platformCredentialAuthenticationMethod"}]}},
+         (), ("no-phishing-resistant-method-sampled",), None),
+        ("a colon-separated thumbprint matches its credential", "entra-saml-config", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "A", "notificationEmailAddresses": ["a@x"],
+                                         "preferredTokenSigningKeyThumbprint": COLON_THUMB,
+                                         "keyCredentials": [{"customKeyIdentifier": HEX40}]}]},
+         (), ("saml-pinned-key-missing",), None),
     ]
     fails = []
     try:
