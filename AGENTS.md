@@ -87,6 +87,16 @@ or `unreadable`. `Index` raises `DatasetUnavailable` when a check reads from a
 dataset that is not `ok`. The runner records `absent` coverage for that check.
 Never turn an unreadable input into a clean negative finding.
 
+### An export node is read through one view
+
+The AzureHound export nests the object under `data`. Earlier versions use
+`properties` or `props`, and the JSON-lines reader hands over the payload
+itself. `node_view()` in `Index` produces one shape for all of them: the object
+id at the top level, the payload under `properties`, and the payload fields
+flattened. Read a node through `idx.props(n)` or through the flattened keys;
+never read `n["data"]` in a check. The object id must survive every shape,
+because `resolve()` and `names` are keyed on it.
+
 ### A path segment may contain a dot
 
 `dig()` tries the whole remaining string as one key before it splits at the

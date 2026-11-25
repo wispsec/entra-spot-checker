@@ -1554,6 +1554,34 @@ class DatasetUnavailable(Exception):
     """
 
 
+def node_view(raw):
+    """One export node in the shape the checks read.
+
+    An AzureHound export nests the object under "data". Older exports use
+    "properties" or "props", and the JSON-lines reader hands over the payload
+    itself. A check reads the id at the top level and the fields through props(),
+    so one node carries both views.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    kind = str(raw.get("kind") or "")
+    payload = None
+    for key in ("data", "properties", "props"):
+        found = raw.get(key)
+        if isinstance(found, dict):
+            payload = found
+            break
+    if payload is None:
+        payload = raw if raw.get("id") and not kind else {}
+    view = dict(payload)
+    view["properties"] = payload
+    if kind:
+        view["kind"] = kind
+    if payload.get("id") or raw.get("id"):
+        view["id"] = payload.get("id") or raw.get("id")
+    return view
+
+
 class Index:
     def __init__(self, nodes, state="ok", detail=""):
         self._by_kind = defaultdict(list)
@@ -1562,7 +1590,8 @@ class Index:
         self.state = state
         self.detail = detail
         self.skipped = 0
-        for n in nodes:
+        for raw in nodes:
+            n = node_view(raw)
             if not isinstance(n, dict):
                 self.skipped += 1
                 continue
@@ -1711,8 +1740,7 @@ def load_ah(path):
             if isinstance(obj, list):
                 nodes.extend(obj)
             elif isinstance(obj, dict):
-                payload = obj.get("data")
-                nodes.extend(payload if isinstance(payload, list) else [payload or obj])
+                nodes.append(obj)
         if not nodes:
             return [], "unreadable", str(path) + " is neither JSON nor JSON lines"
         return nodes, "ok", ""
@@ -5341,18 +5369,23 @@ def c_immutable(ctx):
     idx = ctx["idx"]
     seen = defaultdict(list)
     n = 0
+    carried = 0
     for u in idx.users():
         p = idx.props(u)
+        if "onPremisesImmutableId" in p:
+            carried += 1
         iid = p.get("onPremisesImmutableId")
         if iid:
             n += 1
             seen[str(iid)].append(p.get("userPrincipalName") or u.get("id"))
-    note("entra-immutableid", n)
+    note("entra-immutableid", len(idx.users()))
     for iid, users in seen.items():
         if len(users) > 1:
             add("critical", "duplicate-immutable-id", iid, "users=" + ",".join(users[:4]), "two objects share a source anchor; object takeover on next sync")
-    if n == 0:
+    if n == 0 and carried:
         add("info", "no-synced-objects", "tenant", "0 users with onPremisesImmutableId", "no hybrid sync anchor present in this dataset")
+    elif n == 0:
+        undecided("immutable-id-unread", "users=" + str(len(idx.users())) + " carry no onPremisesImmutableId property", "the export does not carry the source anchor, so a hybrid directory cannot be ruled out")
 
 
 @check("entra-federation")
@@ -5395,6 +5428,10 @@ def c_pwpolicy(ctx):
     users = idx.users()
     note("entra-password-policy", len(users))
     if not users:
+        return
+    carried = [u for u in users if "passwordPolicies" in idx.props(u)]
+    if not carried:
+        undecided("password-policy-unread", "no user carries passwordPolicies", "the export does not carry the password policy per user, so the expiry state is unknown")
         return
     expired = [u for u in users if "DisablePasswordExpiration" in str(idx.props(u).get("passwordPolicies") or "")]
     if expired:

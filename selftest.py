@@ -19,10 +19,15 @@ ALLOWED = {
     "check-error",
 }
 
+# The shape an AzureHound export uses: the object is nested under "data".
 SAMPLE_NODES = [
-    {"kind": "AZUser", "id": "u1", "properties": {"displayName": "User One", "userPrincipalName": "u1@example.com", "accountEnabled": True}},
-    {"kind": "AZGroup", "id": "g1", "properties": {"displayName": "Group One"}},
-    {"kind": "AZServicePrincipal", "id": "s1", "properties": {"displayName": "SP One", "appId": "a1"}},
+    {"kind": "AZUser", "data": {"id": "u1", "displayName": "User One", "userPrincipalName": "u1@example.com",
+                                "accountEnabled": True, "userType": "Member", "onPremisesSyncEnabled": False,
+                                "passwordPolicies": None}},
+    {"kind": "AZGroup", "data": {"id": "g1", "displayName": "Group One", "securityEnabled": True,
+                                 "isAssignableToRole": False}},
+    {"kind": "AZServicePrincipal", "data": {"id": "s1", "displayName": "SP One", "appId": "a1",
+                                            "servicePrincipalType": "Application"}},
 ]
 
 
@@ -89,6 +94,51 @@ def _run(name, ctx, **fakes):
         for k, v in keep.items():
             setattr(M, k, v)
     return {f["check"] for f in M.FINDINGS}
+
+
+def load_shape():
+    """load_ah() reads each document shape an export uses, and keeps the kind."""
+    import tempfile
+    cases = [
+        ('{"data": [{"kind": "AZUser", "data": {"id": "u1"}}]}', 1),
+        ('[{"kind": "AZUser", "data": {"id": "u1"}}]', 1),
+        ('{"kind": "AZUser", "data": {"id": "u1"}}\n{"kind": "AZGroup", "data": {"id": "g1"}}\n', 2),
+    ]
+    directory = tempfile.mkdtemp()
+    try:
+        for index, (body, expected) in enumerate(cases):
+            path = os.path.join(directory, "export%d.json" % index)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            nodes, state, _detail = M.load_ah(path)
+            assert state == "ok", (index, state)
+            assert len(nodes) == expected, (index, nodes)
+            kinds = M.Index(nodes).kinds
+            assert kinds, (index, nodes)
+    finally:
+        for name in os.listdir(directory):
+            os.remove(os.path.join(directory, name))
+        os.rmdir(directory)
+
+
+def dataset_shape():
+    """One node is readable in every export shape the loader accepts.
+
+    The payload key has moved between AzureHound versions: "data" today,
+    "properties" or "props" earlier. A node that carries its object id outside
+    the payload must keep it, because resolve() is keyed on it.
+    """
+    for key in ("data", "properties", "props"):
+        idx = M.Index([{"kind": "AZUser", key: {"id": "x1", "displayName": "D", "userPrincipalName": "u@x"}}])
+        user = idx.users()[0]
+        assert idx.props(user)["displayName"] == "D", key
+        assert idx.name(user) == "D", key
+        assert idx.resolve("x1") == "D", key
+        assert idx.kinds["azuser"] == 1, key
+    idx = M.Index([{"kind": "AZUser", "id": "x2", "properties": {"displayName": "E"}}])
+    assert idx.users()[0]["id"] == "x2"
+    assert idx.name(idx.users()[0]) == "E"
+    assert M.Index([]).kinds == {}
 
 
 def path_reads():
@@ -794,6 +844,8 @@ def payloads():
 
 def main():
     invariants()
+    load_shape()
+    dataset_shape()
     path_reads()
     regressions()
     fails = payloads()
