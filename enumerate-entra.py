@@ -553,6 +553,7 @@ def _merge_ca_beta(rows, limit):
         if not src:
             continue
         for path, head, leaf in (("conditions.deviceStates", "conditions", "deviceStates"),
+                                 ("conditions.authenticationFlows", "conditions", "authenticationFlows"),
                                  ("sessionControls.secureSignInSession", "sessionControls", "secureSignInSession"),
                                  ("sessionControls.continuousAccessEvaluation", "sessionControls", "continuousAccessEvaluation"),
                                  ("grantControls.authenticationStrength", "grantControls", "authenticationStrength")):
@@ -3521,7 +3522,10 @@ def c_ca(ctx):
     if pols and not ca_complete():
         capped(CURRENT["check"], len(pols), "conditional access policy pages")
     if ca_complete() and not restricts_flows:
-        add("high", "ca-device-code-flow-unrestricted", "tenant", "no policy sets conditions.authenticationFlows", "device code flow issues tokens with password-only authentication")
+        if CA_BETA["state"] != "ok":
+            undecided("ca-flow-condition-unread", "authenticationFlows read from v1.0 only", "the flow condition is a beta field, so an absent value is not a verdict")
+        else:
+            add("high", "ca-device-code-flow-unrestricted", "tenant", "no policy sets conditions.authenticationFlows", "device code flow issues tokens with password-only authentication")
     if ca_complete() and not has_frequency:
         add("medium", "ca-no-signin-frequency", "tenant", "no sessionControls.signInFrequency", "stolen tokens stay valid for their full lifetime")
     if ca_complete() and not has_risk:
@@ -8348,7 +8352,10 @@ def c_group_members(ctx):
     if not group_ids:
         add("info", "no-role-holding-groups", "tenant", "roleAssignments=" + str(len(assignments)) + " groupPrincipals=0", "no directory role is granted through a group")
         return
-    guests = set(scan_guests(ctx) or set())
+    found = scan_guests(ctx)
+    if found is None:
+        deny("entra-group-members-guest")
+    guests = set(lst(found))
     trunc("entra-group-members-guest", len(list(group_ids)[:15]), len(group_ids), "role-holding groups")
     for gid in list(group_ids)[:15]:
         doc = graph("groups/" + gid + "/members?$select=id,displayName,userType", beta=True)
@@ -8649,7 +8656,9 @@ def c_tou(ctx):
         note("entra-terms-of-use", 0, denied=1)
         return
     note("entra-terms-of-use", len(docs))
-    per_agreement = Counter(str(dig(a, "agreementId")) for a in (accept if accept is not None else []))
+    if accept is None:
+        deny("entra-terms-of-use")
+    per_agreement = Counter(str(dig(a, "agreementId")) for a in lst(accept))
     for d in docs:
         if dig(d, "isViewingBeforeAcceptanceRequired") is False:
             add("low", "tou-not-gated", str(dig(d, "displayName")), "isViewingBeforeAcceptanceRequired=false", "the agreement is not required before access")
@@ -9216,7 +9225,7 @@ def c_pta(ctx):
         return
     for g in items:
         agents = lst(dig(g, "agents"))
-        name = str(val(dig(g, "agentGroup"), dig(g, "id")))
+        name = str(val(dig(g, "displayName"), dig(g, "id")))
         add("info", "pta-agent-group", name, "agents=" + str(len(agents)), "each agent validates passwords against the on-premises directory")
         for a in agents:
             if str(val(dig(a, "status"), "")).lower() != "active":
@@ -9442,7 +9451,7 @@ def c_seamless_sso(ctx):
     agents = graph_all("onPremisesPublishingProfiles/authentication/agentGroups", limit=3, beta=True)
     if agents is not None:
         groups = agents
-        active = [g for g in groups if str(val(dig(g, "agentGroup"), "")).lower() or lst(dig(g, "agents"))]
+        active = [g for g in groups if lst(dig(g, "agents"))]
         add("info", "seamless-sso-agent-groups", "tenant", "groups=" + str(len(groups)) + " withAgents=" + str(len(active)), "hybrid authentication agents registered in this tenant")
     add("low", "seamless-sso-key-rotation-unverifiable", "tenant", "AZUREADSSOACC is an on-premises AD computer object", "Entra exposes no view of this object; confirm its Kerberos decryption key rotation on the domain controller")
 
