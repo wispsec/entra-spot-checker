@@ -2876,7 +2876,7 @@ def dynamic_groups(ctx):
 
 
 # Who can steer a dynamic rule, from easiest to hardest.
-STEER_ORDER = ("guest", "device", "privileged", "fixed")
+STEER_ORDER = ("neutral", "guest", "device", "privileged", "fixed")
 STEER_OPEN = ("guest", "device")
 STEER_LABEL = {"guest": "anyone who can invite a guest", "device": "anyone who can register a device",
                "privileged": "attribute writer (admin, on-prem sync or app with User.ReadWrite.All)"}
@@ -2892,7 +2892,9 @@ def rule_steer(rule):
     steer is who can change membership: guest (an invited guest matches), device
     (whoever registers a device sets the value), privileged (an admin, on-prem sync or
     an app writes the attribute: extensionAttributeN, extension_<appId>_*, custom
-    security attributes, onPremises*, memberOf) or fixed.
+    security attributes, onPremises*, memberOf) or fixed. A negated comparison is
+    neutral: "X -ne true" asks nobody to set X, because a fresh object lacks it, so
+    it neither raises nor lowers the difficulty of the rule it sits in.
     -or picks the easiest branch, -and the hardest; -and binds tighter than -or, as in
     Entra. A userType Member guard closes guest terms in its own -and group.
     ponytail: token heuristic per leaf; -not is ignored and -match is read as loose.
@@ -2902,7 +2904,8 @@ def rule_steer(rule):
     terms = RULE_TERM.findall(text)
     if not terms:
         return "fixed", []
-    return _steer_expr(text, False), sorted({a for a, _, _ in terms})
+    steer = _steer_expr(text, False)
+    return ("guest" if steer == "neutral" else steer), sorted({a for a, _, _ in terms})
 
 
 RULE_GUARD = re.compile(r'^user\.usertype\s+-(?:eq\s+"?member|ne\s+"?guest|in\s+\[\s*"member"\s*\])')
@@ -2974,6 +2977,8 @@ def _steer_term(attr, op, value, guarded):
             return "guest"
         if attr == "user.objectid" and not negated:
             return "fixed"
+        if negated:
+            return "neutral"
         return "privileged"
     if attr in DEVICE_SET and (attr != "device.accountenabled" or every_enabled):
         return "device"
