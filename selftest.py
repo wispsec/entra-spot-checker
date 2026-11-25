@@ -517,9 +517,177 @@ def reset():
     M.CURRENT["suppress"] = False
 
 
+def payloads():
+    """Success-path cases: a documented payload shape must produce the stated verdict.
+
+    The failure-path sweep below cannot see a check that reads the wrong field from
+    a payload it successfully received, which is how every schema defect in this
+    tree arrived. Each case here encodes one rule, so the rule is checked rather
+    than remembered.
+    """
+    home = "11111111-1111-1111-1111-111111111111"
+    foreign = "22222222-2222-2222-2222-222222222222"
+    ga = "62e90394-69f5-4237-9190-012177145e10"
+    owner = "/providers/microsoft.authorization/roledefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+    keep_home = M.HOME_TENANT["id"]
+    keep_beta = M.CA_BETA["state"]
+    M.HOME_TENANT["id"] = home
+    M.CA_BETA["state"] = "ok"
+    idx = M.Index(list(SAMPLE_NODES))
+    orphan_idx = M.Index(list(SAMPLE_NODES))
+    orphan_idx.absent.add("gone")
+
+    def rows(fn):
+        return lambda q, subs, scoped=True, **k: fn(q)
+
+    def evidence(finding_id):
+        return [f for f in M.FINDINGS if f["check"] == finding_id]
+
+    def ga_defs(p, *a, **k):
+        return ([{"id": "d1", "templateId": ga, "displayName": "Global Administrator"}]
+                if "roleDefinitions" in p else [{"principalId": "p1", "roleDefinitionId": "d1"}])
+
+    cases = [
+        ("a federated issuer is an STS URL, not a tenant id", "entra-linked-identities", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"userPrincipalName": "u@x", "identities": [
+             {"issuer": "https://sts.windows.net/" + home + "/", "signInType": "federated"}]}]},
+         (), ("federated-identity-unknown-issuer",), None),
+        ("a foreign federated issuer is reported", "entra-linked-identities", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"userPrincipalName": "u@x", "identities": [
+             {"issuer": "https://sts.windows.net/" + foreign + "/", "signInType": "federated"}]}]},
+         ("federated-identity-unknown-issuer",), (), None),
+        ("includeRoles carries template ids", "entra-ca-scope-detail", {"subs": []},
+         {"ca_all": lambda *a, **k: [{"state": "enabled", "displayName": "P", "conditions": {
+             "users": {"includeRoles": [ga]}, "applications": {}}}],
+          "graph_all": lambda *a, **k: [{"id": "obj-1", "templateId": ga, "displayName": "Global Administrator"}]},
+         (), ("ca-role-uncovered",), None),
+        ("persistent browser enabled with mode always is not a control", "entra-ca-session", {"subs": []},
+         {"ca_all": lambda *a, **k: [{"state": "enabled", "displayName": "P", "sessionControls": {
+             "persistentBrowser": {"isEnabled": True, "mode": "always"}}}]},
+         ("no-persistent-browser-control",), (), None),
+        ("a deny default action closes the site", "sub-appservice-restrictions", {"subs": ["s1"]},
+         {"arg_rows": rows(lambda q: [{"parent": "/subscriptions/s1/resourcegroups/rg/providers/microsoft.web/sites/app",
+                                       "ips": [], "scm": [], "scmMain": "", "defaultAction": "Deny"}]
+                           if "sites/config" in q else
+                           [{"name": "app", "subscriptionId": "s1", "rg": "rg", "clientCert": None}])},
+         (), ("appservice-no-ip-restriction",), None),
+        ("the DDoS enum is VirtualNetworkInherited", "sub-publicip-sku", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "ip1", "subscriptionId": "s1", "sku": "Standard",
+                                        "ddos": "VirtualNetworkInherited"}]},
+         (), ("publicip-no-ddos",), None),
+        ("a strength outside the map is undecided, not absent", "entra-mfa-baseline", {"subs": []},
+         {"graph": lambda *a, **k: {"isEnabled": False},
+          "ca_all": lambda *a, **k: [{"state": "enabled", "displayName": "P",
+                                      "grantControls": {"authenticationStrength": {"id": "unmapped"}},
+                                      "conditions": {"users": {"includeUsers": ["All"]},
+                                                     "applications": {"includeApplications": ["All"]}}}],
+          "_strengths": lambda: {}},
+         ("mfa-control-unread",), ("mfa-not-required-for-all",), None),
+        ("a service-principal owner is an owner", "entra-role-assignable-groups", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"id": "g1", "displayName": "G", "membershipRule": None}],
+          "graph": lambda *a, **k: {"value": [{"id": "sp1", "displayName": "SP"}]}},
+         ("role-assignable-group-owned-by-sp",), ("role-assignable-group-ownerless",), None),
+        ("the review target is the scope query", "entra-access-review-scope", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "R", "status": "Active",
+                                         "scope": {"query": "/groups/x/transitiveMembers"}}]},
+         ("access-review-scope",), ("access-reviews-only-apps",), None),
+        ("an unset partner inbound inherits a blocked default", "entra-cross-tenant-escalation",
+         {"subs": [], "idx": idx},
+         {"graph_all": lambda p, *a, **k: [{"tenantId": foreign, "inboundTrust": {"isMfaAccepted": True}}]
+          if "partners" in p else [],
+          "graph": lambda *a, **k: {"b2bCollaborationInbound": {"usersAndGroups": {"accessType": "blocked"}}},
+          "scan_guests": lambda c: set()},
+         (), ("cross-tenant-trust-bypass",), None),
+        ("the default domain is one mailbox, a custom domain is not", "sub-security-contacts", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "c1", "subscriptionId": "s1", "email": "a@contoso.onmicrosoft.com"},
+                                       {"name": "c2", "subscriptionId": "s1", "email": "soc@contoso.com"}]},
+         ("security-contact-single-person",), (), lambda: [f["subject"] for f in evidence("security-contact-single-person")] == ["c1"]),
+        ("orphan detection reads the assignments made to the principal", "sub-approle-orphans",
+         {"subs": [], "idx": orphan_idx},
+         {"graph": lambda p, *a, **k: {"value": [{"principalId": "gone", "resourceDisplayName": "API"}]}
+          if "appRoleAssignedTo" in p else None},
+         ("orphaned-app-role-assignment",), (), None),
+        ("an agent group list is a list", "entra-pta-agents", {"subs": []},
+         {"graph": lambda p, *a, **k: {"value": [{"onPremisesSyncEnabled": True}]} if "organization" in p else None,
+          "graph_all": lambda *a, **k: [{"id": "g1", "displayName": "grp",
+                                         "agents": [{"status": "inactive", "machineName": "m1"}]}]},
+         ("pta-agent-group", "pta-agent-inactive"), ("no-pta-agents",), None),
+        ("a token lifetime definition is a JSON string", "entra-token-lifetime", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"displayName": "P", "definition": ['{"MaxInactiveTime":"PT1H"}']}]},
+         ("token-lifetime-policy",), (), lambda: "MaxInactiveTime=PT1H" in evidence("token-lifetime-policy")[0]["evidence"]),
+        ("zero policies leaves device code flow unrestricted", "entra-ca",
+         {"subs": [], "idx": idx, "dynamic": set(), "dyn": {}},
+         {"ca_all": lambda *a, **k: []},
+         ("ca-device-code-flow-unrestricted", "ca-no-signin-frequency"), (), None),
+        ("a disabled role policy is not coverage", "entra-ca-roles", {"subs": []},
+         {"ca_all": lambda *a, **k: [{"state": "disabled", "displayName": "P",
+                                      "conditions": {"users": {"includeRoles": [ga]}}}]},
+         ("ca-no-role-targeting",), (), None),
+        ("the PIM alert switch is top level", "entra-pim-alerts", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"id": "a1", "isEnabled": True, "alertDefinition": {"displayName": "X"}}]},
+         ("pim-alert",), (), lambda: "enabled=True" in evidence("pim-alert")[0]["evidence"]),
+        ("an unread guest list is unknown, not a plain principal", "sub-rbac-write", {"subs": ["s1"]},
+         {"arg_rows": rows(lambda q: [{"id": owner, "name": "Owner", "perms": [{"actions": ["*"]}]}]
+                           if "roledefinitions" in q else
+                           [{"principalId": "p1", "roleId": owner, "scope": "/subscriptions/s1"}]),
+          "scan_guests": lambda c: None},
+         ("principal-can-grant-access",), (), lambda: "type=unknown" in evidence("principal-can-grant-access")[0]["evidence"]),
+        ("an unread catalog endpoint is not zero catalogs", "entra-governance", {"subs": []},
+         {"graph_all": lambda p, *a, **k: None if "catalogs" in p else []},
+         ("catalog-count-unreadable",), ("catalog-count",), None),
+        ("an unresolved resource is not Microsoft Graph", "entra-app-overscope", {"subs": []},
+         {"graph_all": lambda p, *a, **k: [{"clientId": "sp-client", "resourceId": "sp-missing", "scope": "User.Read"}]
+          if "oauth2PermissionGrants" in p else
+          ([{"appId": "app-1", "displayName": "A", "requiredResourceAccess": []}] if "applications" in p
+           else [{"id": "sp-client", "appId": "app-1", "displayName": "A"}])},
+         ("grant-resource-unresolved",), ("grant-without-manifest-scope",), None),
+        ("a settings gap is per subscription", "sub-security-settings", {"subs": ["s1", "s2"]},
+         {"arg_rows": lambda *a, **k: [{"name": "mcas", "subscriptionId": "s1"},
+                                       {"name": "sentinel", "subscriptionId": "s1"}]},
+         ("security-setting-absent",), (), lambda: [f["subscription"] for f in evidence("security-setting-absent")] == ["s1"]),
+        ("a management-group row belongs to the tenant", "sub-custom-roles", {"subs": ["s1"]},
+         {"arg_rows": rows(lambda q: [{"name": "Custom", "subscriptionId": "",
+                                       "id": "/providers/Microsoft.Management/mg1/providers/microsoft.authorization/roledefinitions/x",
+                                       "perms": [{"actions": ["microsoft.authorization/roleassignments/write"]}]}]
+                           if "roledefinitions" in q else [])},
+         ("custom-role-privilege-grant",), (), lambda: evidence("custom-role-privilege-grant")[0]["subscription"] == "tenant"),
+        ("an unread capability set draws no severity", "entra-dynamic-groups",
+         {"subs": [], "dynamic": set(), "dyn": {}},
+         {"dynamic_groups": lambda c: c.setdefault("dyn_rules", {"g1": ("DG", 'user.mail -contains "x"', "On")}),
+          "_group_capabilities": lambda c, g: ({}, set(g))},
+         ("dynamic-group-grant-unread",), ("dynamic-group-steerable",), None),
+        ("an unread policy list draws no exclusion verdict", "entra-breakglass-hardening", {"subs": []},
+         {"graph_all": ga_defs, "ca_all": lambda *a, **k: None,
+          "graph": lambda p, *a, **k: {"value": []} if "methods" in p else {"displayName": "A"}},
+         ("breakglass-exclusion-unread",), ("breakglass-not-excluded",), None),
+    ]
+    fails = []
+    try:
+        for label, name, ctx, fakes, want, unwanted, probe in cases:
+            got = _run(name, ctx, **fakes)
+            for finding in want:
+                if finding not in got:
+                    fails.append(label + ": missing " + finding)
+            for finding in unwanted:
+                if finding in got:
+                    fails.append(label + ": unexpected " + finding)
+            if probe is not None and not probe():
+                fails.append(label + ": evidence or attribution differs")
+    finally:
+        M.HOME_TENANT["id"] = keep_home
+        M.CA_BETA["state"] = keep_beta
+    return fails
+
+
 def main():
     invariants()
     regressions()
+    fails = payloads()
+    if fails:
+        print("payload cases that produced the wrong verdict: " + str(len(fails)))
+        for line in fails:
+            print("  " + line)
+        return 1
     fail_all()
     idx = M.Index(list(SAMPLE_NODES))
     offenders = []

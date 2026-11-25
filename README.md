@@ -6,7 +6,7 @@ for each area whether it was assessed and why.
 
 `enumerate-entra.py` is one file and imports only the Python 3 standard library.
 There is no packaging step and no third-party dependency. `selftest.py` sits
-beside it and exercises the failure paths.
+beside it and exercises the failure paths and the documented payload shapes.
 
 ## What it does
 
@@ -142,16 +142,27 @@ sign-in history older than the retention window.
 
 The tool probes data-plane access. A denied probe is recorded as a coverage gap.
 
-## Failure-path self-test
+## Self-test
 
 ```bash
 python3 selftest.py
 ```
 
-Stubs every transport call to return `None`, then runs all checks. It asserts
-three things: no check raises, no check emits a `medium`, `high` or `critical`
-finding, and no check that made a transport call reports `ok` or `empty` with no
-findings. It exits 1 and names the offending check.
+Two suites run in one process.
+
+The failure-path suite stubs every transport call to return `None`, then runs
+all checks. It asserts three things: no check raises, no check emits a `medium`,
+`high` or `critical` finding, and no check that made a transport call reports
+`ok` or `empty` with no findings.
+
+The payload suite runs one check against a documented payload shape and asserts
+the finding that must appear and the finding that must not, including the
+evidence and the attribution where those are the part that would be wrong. It
+covers the defects that a failure-path stub cannot see: a field read from the
+wrong path, an enum value outside its domain, an identifier compared across two
+namespaces.
+
+It exits 1 and names the failing case or the offending check.
 
 ## Known limitations
 
@@ -173,7 +184,7 @@ findings. It exits 1 and names the offending check.
 | File | Content |
 |---|---|
 | `enumerate-entra.py` | The enumerator. |
-| `selftest.py` | Failure-path regression test. See above. |
+| `selftest.py` | Failure-path and payload regression suites. See above. |
 | `.lint-baseline` | Construct budget: total plus per-check counts. |
 | `AGENTS.md` | Rules for changing the enumerator. |
 | `README.md` | This file. |

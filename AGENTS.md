@@ -8,7 +8,9 @@ breaking it.
 
 - `enumerate-entra.py` is one 10,000-line Python file with 314 `@check` functions.
   Standard library only. No packaging step.
-- `selftest.py` is the failure-path regression test. It imports the script by path.
+- `selftest.py` carries two suites. `fail_all()` asserts that a total read
+  failure produces no verdict. `payloads()` asserts that a documented payload
+  shape produces the stated verdict. It imports the script by path.
 - `.lint-baseline` is a committed gate file. It holds a total and one count per
   check.
 - `README.md` and `LICENSE` are documentation. Keep them true.
@@ -117,6 +119,18 @@ attribution behind.
    deliberate and `trunc()` or `capped()` when pagination stopped early.
 7. Add the finding id to `FRAMEWORK` with a CWE and a register tag, or verify
    that a `PREFIX_RULES` token matches it. The lint gate rejects an untagged id.
+
+## A fixed defect gets a case
+
+Add a `payloads()` case for every defect fixed in a check. The failure-path
+suite cannot see a wrong field name, a wrong enum value or an identifier read
+from the wrong namespace, and those are the defects that reach a report. A rule
+that lives only in a review comment is broken again by the next edit.
+
+The case states the payload, the check, the finding that must appear and the
+finding that must not. Assert the evidence or the attribution when that is the
+part that was wrong. A case that cannot fail is not a case: revert the fix once
+and confirm the case reports it.
 
 ## Finding ids
 
