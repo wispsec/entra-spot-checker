@@ -1,4 +1,4 @@
-total 1325
+total 1315
 check entra-admin-unit-scope 5
 check entra-agent-identities 1
 check entra-api-scopes 7
@@ -18,13 +18,13 @@ check entra-auth-methods-policy 12
 check entra-authenticator-features 5
 check entra-authorization-policy 13
 check entra-breakglass 6
-check entra-ca 38
+check entra-ca 32
 check entra-ca-inventory 15
 check entra-ca-matrix 5
 check entra-ca-roles 6
 check entra-ca-scope-detail 26
-check entra-ca-session 9
-check entra-ca-workload 6
+check entra-ca-session 7
+check entra-ca-workload 4
 check entra-cba-config 7
 check entra-consent 8
 check entra-cross-tenant 6

@@ -109,16 +109,76 @@ def regressions():
         M.subprocess.run = real_run
     # Conditional Access bypass findings need an enforced policy.
     bypass = {"ca-exclusion-dynamic-group", "ca-all-trusted-locations-excluded", "ca-named-location-excluded",
-              "ca-trusttype-excluded", "ca-device-filter"}
+              "ca-device-filter"}
     idx = M.Index(list(SAMPLE_NODES))
     for state, fires in (("disabled", False), ("enabledForReportingButNotEnforced", False), ("enabled", True)):
         pol = {"state": state, "displayName": "p", "conditions": {
             "users": {"excludeGroups": ["g1"]}, "locations": {"excludeLocations": ["AllTrusted", "loc1"]},
-            "devices": {"excludeDevices": {"trustType": ["AzureAD"]}, "deviceFilter": {"mode": "exclude", "rule": "x"}}}}
+            "devices": {"deviceFilter": {"mode": "exclude", "rule": "x"}}}}
         got = _run("entra-ca", {"dyn_done": True, "dynamic": {"g1"}, "dyn": {"g1": "guest"}, "idx": idx},
                    ca_all=lambda *a, **k: [pol], graph_all=lambda *a, **k: [])
         assert (got >= bypass) if fires else not (got & bypass), state + " " + str(sorted(got & bypass))
         assert fires or not M.CHAINS, state + " produced an attack chain"
+    # A field that only beta returns is merged onto the v1.0 row, never read from v1.0.
+    real_graph_all = M.graph_all
+    M.CA_BETA["state"] = ""
+    M.CA_BETA["policies"] = {}
+    v10 = [{"id": "p1", "displayName": "p", "conditions": {}, "sessionControls": {}, "grantControls": {}}]
+    brows = [{"id": "p1", "conditions": {"deviceStates": {"includeStates": ["All"]}},
+              "sessionControls": {"secureSignInSession": {"isEnabled": True},
+                                  "continuousAccessEvaluation": {"isEnabled": True}},
+              "grantControls": {"authenticationStrength": {"id": "s1"}}}]
+    try:
+        M.graph_all = lambda path, limit=25, beta=False, max_pages=None: brows if beta else v10
+        assert M._merge_ca_beta(v10, 5) is True
+    finally:
+        M.graph_all = real_graph_all
+    assert v10[0]["conditions"]["deviceStates"]["includeStates"] == ["All"], v10
+    assert v10[0]["sessionControls"]["secureSignInSession"]["isEnabled"] is True, v10
+    assert v10[0]["grantControls"]["authenticationStrength"]["id"] == "s1", v10
+    M.CA_BETA["state"] = ""
+    M.CA_BETA["policies"] = {}
+    # User actions live under applications, not under conditions.
+    pol = {"state": "enabled", "displayName": "p",
+           "conditions": {"users": {"excludeRoles": ["r1"]},
+                          "applications": {"includeUserActions": ["urn:user:registersecurityinfo"]}}}
+    _run("entra-ca", {"idx": idx, "dynamic": set(), "dyn_done": True},
+         ca_all=lambda *a, **k: [pol], graph_all=lambda *a, **k: [], licensed=lambda p: False)
+    hits = [f for f in M.FINDINGS if f["check"] == "ca-user-action-policy"]
+    assert hits and hits[0]["severity"] == "high", M.FINDINGS
+    # Device states are a condition-set property, not a device-filter property.
+    pol = {"state": "enabled", "displayName": "p",
+           "conditions": {"deviceStates": {"includeStates": ["Compliant"]}}}
+    got = _run("entra-ca-scope-detail", {"idx": idx, "dynamic": set()},
+               ca_all=lambda *a, **k: [pol], graph_all=lambda *a, **k: None)
+    assert "ca-device-state-restricted" in got, got
+    # Token protection is read from the merged beta field, and its absence is not a verdict.
+    pol = {"state": "enabled", "displayName": "p",
+           "sessionControls": {"secureSignInSession": {"isEnabled": True}}}
+    M.CA_BETA["state"] = "ok"
+    got = _run("entra-ca-session", {"idx": idx}, ca_all=lambda *a, **k: [pol])
+    assert "session-token-protection" in got and "no-token-protection" not in got, got
+    M.CA_BETA["state"] = "failed"
+    bare = {"state": "enabled", "displayName": "p", "sessionControls": {}}
+    got = _run("entra-ca-session", {"idx": idx}, ca_all=lambda *a, **k: [bare])
+    assert "no-token-protection" not in got and "ca-session-control-unread" in got, got
+    M.CA_BETA["state"] = ""
+    # A strength-based policy is not a missing MFA policy.
+    pol = {"state": "enabled", "displayName": "p",
+           "conditions": {"users": {"includeUsers": ["All"]}, "applications": {"includeApplications": ["All"]}},
+           "grantControls": {"authenticationStrength": {"id": "s1"}}}
+    got = _run("entra-mfa-baseline", {"idx": idx}, ca_all=lambda *a, **k: [pol],
+               graph=lambda *a, **k: {"isEnabled": False},
+               _strengths=lambda: {"s1": ("Phishing resistant", ["password,fido2"])})
+    assert "mfa-not-required-for-all" not in got, got
+    # A grant control that could not be read is not a verdict either.
+    pol = {"state": "enabled", "displayName": "p",
+           "conditions": {"users": {"includeUsers": ["All"]}, "applications": {"includeApplications": ["All"]}},
+           "grantControls": {}}
+    got = _run("entra-mfa-baseline", {"idx": idx}, ca_all=lambda *a, **k: [pol],
+               graph=lambda *a, **k: {"isEnabled": False}, _strengths=lambda: {})
+    assert "mfa-not-required-for-all" not in got and "mfa-control-unread" in got, got
+    reset()
     # A property the API did not return is unknown, never off.
     rows = [{"name": "v", "subscriptionId": subs[0], "soft": "Enabled", "enhanced": "", "immut": ""}]
     got = _run("sub-backup-rsv-posture", {"subs": subs}, arg_rows=lambda *a, **k: rows)

@@ -35,10 +35,22 @@ GRAPH_DANGEROUS = GRAPH_TIER0 + ("Directory.ReadWrite.All", "User.ReadWrite.All"
 MS_TENANTS = ("72f988bf-86f1-41af-91ab-2d7cd011db47", "f8cdef31-a31e-4b4a-93e4-5f571e91255a",
                "cdc5aeea-15c5-4db6-b079-fcadd2505dc2", "33e01921-4d64-4f8c-a055-5bdaffd5e33d")
 # Application permissions, per resource app, that an owner can hijack by adding a credential.
+# Included only when one app-only grant is sufficient on its own. Azure Service Management,
+# Key Vault, Storage and SQL are absent on purpose: their user_impersonation role only yields
+# a token, and an Azure RBAC assignment or access policy still decides what the token reaches.
 TAKEOVER_ROLES = {
     GRAPH_APP_ID: ("", GRAPH_DANGEROUS),
     "00000002-0000-0ff1-ce00-000000000000": ("Exchange:", ("full_access_as_app", "Exchange.ManageAsApp")),
     "00000003-0000-0ff1-ce00-000000000000": ("SharePoint:", ("Sites.FullControl.All",)),
+    "00000007-0000-0000-c000-000000000000": ("Dynamics:", ("user_impersonation",)),
+    "00000009-0000-0000-c000-000000000000": ("PowerBI:", ("Tenant.ReadWrite.All", "Dataset.ReadWrite.All",
+                                                            "Workspace.ReadWrite.All")),
+    "0000000a-0000-0000-c000-000000000000": ("Intune:", ("DeviceManagementManagedDevices.ReadWrite.All",
+                                                          "DeviceManagementConfiguration.ReadWrite.All",
+                                                          "DeviceManagementApps.ReadWrite.All",
+                                                          "DeviceManagementRBAC.ReadWrite.All",
+                                                          "DeviceManagementServiceConfig.ReadWrite.All")),
+    "499b84ac-1321-427f-aa17-267ca6975798": ("AzureDevOps:", ("user_impersonation",)),
 }
 HOME_TENANT = {"id": "", "name": ""}
 TENANT_NAMES = {}
@@ -444,11 +456,15 @@ def ca_all(kind="policies", limit=5):
                 if second is not None and len(second) != len(rows):
                     add("low", "ca-path-discrepancy", kind, path + "=" + str(len(rows)) + " " + other + "=" + str(len(second)), "the canonical and legacy endpoints disagree; verify the tenant state before trusting either")
                     break
+            if kind == "policies":
+                _merge_ca_beta(rows, limit)
             CA_CACHE[kind] = rows
             return rows
         if first is None:
             first = rows
     if first is not None:
+        if kind == "policies":
+            _merge_ca_beta(first, limit)
         CA_CACHE[kind] = first
         return first
     return None
@@ -457,6 +473,56 @@ def ca_all(kind="policies", limit=5):
 def ca_complete():
     """True when the cached policy list was read without hitting a page cap."""
     return not any(p in TRUNCATED for p in CA_PATH_POLICIES)
+
+
+CA_BETA = {"state": "", "policies": {}}
+
+
+def ca_beta_index(limit=5):
+    """Policies from the beta endpoint, keyed by id.
+
+    The v1.0 read stays the source of truth for the policy set. Beta supplies the
+    fields v1.0 omits: device states, token protection, continuous access
+    evaluation and the authentication strength relationship.
+    """
+    if CA_BETA["state"] == "ok":
+        return CA_BETA["policies"]
+    if CA_BETA["state"] == "failed":
+        return None
+    rows = graph_all("identity/conditionalAccess/policies", limit=limit, beta=True)
+    if rows is None:
+        CA_BETA["state"] = "failed"
+        return None
+    index = {}
+    for p in rows:
+        pid = str(dig(p, "id"))
+        if pid:
+            index[pid] = p
+    CA_BETA["state"] = "ok"
+    CA_BETA["policies"] = index
+    return index
+
+
+def _merge_ca_beta(rows, limit):
+    """Add the beta-only fields to the v1.0 policy rows. False when beta is unread."""
+    extra = ca_beta_index(limit)
+    if extra is None:
+        return False
+    for p in rows:
+        src = extra.get(str(dig(p, "id")))
+        if not src:
+            continue
+        for path, head, leaf in (("conditions.deviceStates", "conditions", "deviceStates"),
+                                 ("sessionControls.secureSignInSession", "sessionControls", "secureSignInSession"),
+                                 ("sessionControls.continuousAccessEvaluation", "sessionControls", "continuousAccessEvaluation"),
+                                 ("grantControls.authenticationStrength", "grantControls", "authenticationStrength")):
+            value = dig(src, path)
+            if value is MISSING:
+                continue
+            block = p.setdefault(head, {})
+            if isinstance(block, dict) and leaf not in block:
+                block[leaf] = value
+    return True
 
 
 SKU_CACHE = {"state": "", "names": set()}
@@ -3181,8 +3247,6 @@ def c_ca(ctx):
             else:
                 add("medium", "ca-named-location-excluded", name, "excludeLocations=" + str(lid), "named location exclusion")
         devices = cond.get("devices") or {}
-        for dtype in ((devices.get("excludeDevices") or {}).get("trustType") or []) if enforced else []:
-            add("high", "ca-trusttype-excluded", name, "excludeDevices.trustType=" + str(dtype), "that device trust class skips the policy")
         if enforced and devices.get("deviceFilter"):
             df = devices.get("deviceFilter") or {}
             add("medium", "ca-device-filter", name, "mode=" + str(df.get("mode")) + " rule=" + str(df.get("rule"))[:60], "device filter decides who is covered; verify the rule")
@@ -3227,7 +3291,7 @@ def c_ca(ctx):
         else:
             add("info", "ca-device-not-licensed", "tenant", "no INTUNE_A service plan", "device compliance needs Intune; its absence is expected here")
     for p in pols:
-        for action in ((p.get("conditions") or {}).get("userActions") or []):
+        for action in lst(dig(p, "conditions.applications.includeUserActions")):
             if action in ("urn:user:registersecurityinfo", "urn:user:registerdevice"):
                 excl = ((p.get("conditions") or {}).get("users") or {}).get("excludeRoles") or []
                 add("high" if excl else "low", "ca-user-action-policy", p.get("displayName"), "action=" + action + " excludeRoles=" + str(len(excl)), "security-info registration can be used to add a persistent MFA method")
@@ -3658,7 +3722,7 @@ def c_ca_workload(ctx):
         note("entra-ca-workload", 0, denied=1)
         return
     note("entra-ca-workload", len(pols))
-    wp = [p for p in pols if ((p.get("conditions") or {}).get("clientApplications") or (p.get("conditions") or {}).get("servicePrincipalFilter"))]
+    wp = [p for p in pols if (p.get("conditions") or {}).get("clientApplications")]
     if not wp:
         add("medium", "no-workload-identity-ca", "tenant", "0 policies target service principals", "workload identities bypass every user policy")
     for p in wp:
@@ -3678,10 +3742,8 @@ def c_ca_session(ctx):
     for p in pols:
         sc = p.get("sessionControls") or {}
         sss = sc.get("secureSignInSession") or {}
-        tprot = sc.get("tokenProtection") or {}
         sss_on = tri(sss.get("isEnabled") if isinstance(sss, dict) else sss) is True
-        tprot_on = tri(tprot.get("isEnabled") if isinstance(tprot, dict) else tprot) is True
-        if sss_on or tprot_on:
+        if sss_on:
             token_protection += 1
             add("info", "session-token-protection", p.get("displayName"), "secureSignInSession=true", "token protection active")
         if tri(dig(sc, "persistentBrowser.isEnabled")) is True or str(val(dig(sc, "persistentBrowser.mode"), "")).lower() == "never":
@@ -3690,8 +3752,10 @@ def c_ca_session(ctx):
             casb += 1
         if sc.get("continuousAccessEvaluation"):
             add("info", "session-cae", p.get("displayName"), "continuousAccessEvaluation=" + str(sc.get("continuousAccessEvaluation")), "near-real-time revocation")
-    if not token_protection:
+    if not token_protection and CA_BETA["state"] == "ok":
         add("medium", "no-token-protection", "tenant", "0 policies with secureSignInSession", "a stolen token can be replayed from any device; requires P2")
+    elif not token_protection:
+        undecided("ca-session-control-unread", "session controls read from v1.0 only", "token protection is a beta session control, so its absence is not a verdict")
     if not browser:
         add("low", "no-persistent-browser-control", "tenant", "0 policies with persistentBrowser", "browser session persistence uncontrolled")
     if not casb:
@@ -4171,9 +4235,11 @@ def _owner_takeover(cap=40):
     examined = 0
     for app_id, (label, wanted) in TAKEOVER_ROLES.items():
         what = (label.rstrip(":") or "Microsoft Graph") + " service principal"
-        resource = unread(graph("servicePrincipals?$filter=appId eq '" + app_id + "'&$select=id,appRoles"),
-                          what, "app-owner-takeover-unassessed")
+        resource = graph("servicePrincipals?$filter=appId eq '" + app_id + "'&$select=id,appRoles")
         if resource is None:
+            # absent: the resource app is not provisioned in this tenant, so nothing can be granted on it.
+            if az_kind() != "absent":
+                unread(None, what, "app-owner-takeover-unassessed")
             continue
         first = lst(dig(resource, "value"))[:1]
         if not first:
@@ -6493,6 +6559,7 @@ def c_mfa_baseline(ctx):
         add("info", "security-defaults-enabled", "tenant", "isEnabled=true", "MFA required for all users by baseline policy")
         return
     covers_all = []
+    unclassified = []
     strengths = _strengths()
     strength_unknown = strengths is None
     for p in enabled:
@@ -6510,12 +6577,17 @@ def c_mfa_baseline(ctx):
         holes = len(lst(dig(users, "excludeUsers"))) + len(lst(dig(users, "excludeGroups"))) + len(lst(dig(users, "excludeRoles"))) + len(lst(dig(apps, "excludeApplications")))
         if all_users and all_apps and (("mfa" in controls) or strength_ok):
             covers_all.append(str(dig(p, "displayName")) + ("(exclusions=" + str(holes) + ")" if holes else ""))
+        elif all_users and all_apps and "mfa" not in controls and dig(gc, "authenticationStrength") is MISSING:
+            unclassified.append(str(dig(p, "displayName")))
     if covers_all:
         add("info", "mfa-all-users-covered", "tenant", "policies=" + ",".join([str(x) for x in covers_all]), "an enforced policy requires MFA for all users and apps; any exclusion shown in brackets is a bypass")
     elif strength_unknown and any(val(dig(p, "grantControls.authenticationStrength"), "") for p in enabled):
         add("info", "mfa-baseline-unassessed", "tenant", "authenticationStrength unreadable enforcedPolicies=" + str(len(enabled)), "the policy set uses custom authentication strengths, so the MFA requirement cannot be confirmed or denied")
     elif not ca_complete():
         capped("entra-mfa-baseline", len(pols), "conditional access policy pages")
+    elif unclassified:
+        undecided("mfa-control-unread", "policies=" + ",".join(unclassified[:3]),
+                  "a policy covers all users and applications but its grant control could not be read, so the MFA verdict is not drawn")
     else:
         add("high", "mfa-not-required-for-all", "tenant", "securityDefaults=off coveringPolicies=0 enforcedPolicies=" + str(len(enabled)), "no policy requires MFA for all users and all applications")
 
@@ -7034,7 +7106,7 @@ def c_ca_scope(ctx):
         if included and "all" not in [i.lower() for i in included]:
             add("low", "ca-platform-restricted", name, "includePlatforms=" + ",".join(included), "other platforms are outside this control")
         dev = cond.get("devices") or {}
-        include_states = [str(x) for x in lst(dig(dev, "deviceStates.includeStates"))]
+        include_states = [str(x) for x in lst(dig(cond, "deviceStates.includeStates"))]
         if include_states and "all" not in [x.lower() for x in include_states]:
             add("low", "ca-device-state-restricted", name, "deviceStates=" + ",".join(include_states), "device filter narrows the population")
         locs = cond.get("locations") or {}
