@@ -192,8 +192,11 @@ def regressions():
     w_idx = M.Index([{"kind": "AZUser", "id": "u1", "properties": {"userPrincipalName": "a@example.com"}}], "ok")
 
     def w_graph_all(path, limit=25, beta=False, max_pages=None):
+        if "roleDefinitions" in path:
+            return [{"id": "rd1", "displayName": "Global Administrator",
+                     "rolePermissions": [{"allowedResourceActions": ["microsoft.directory/x/allTasks"]}]}]
         if "roleAssignments" in path:
-            return [{"principalId": "g1", "roleDefinitionId": "/roleDefinitions/62e90394-69f5-4237-9190-012177145e10"}]
+            return [{"principalId": "g1", "roleDefinitionId": "rd1"}]
         return []
 
     def w_graph(path, beta=False):
@@ -203,11 +206,37 @@ def regressions():
             return {"value": [{"userPrincipalName": "dev@example.com"}]}
         return {"value": []}
 
-    got = _run("entra-attribute-writers", {"idx": w_idx, "dynamic": set(), "dyn_done": True},
+    wctx = {"idx": w_idx, "dynamic": set(), "dyn_done": True}
+    got = _run("entra-attribute-writers", wctx,
                dynamic_groups=lambda ctx: {"g1": ("Priv", 'user.extension_' + app_id + '_team -eq "red"', "On")},
                graph_all=w_graph_all, graph=w_graph)
     assert "schema-extension-steers-role-group" in got, got
-    assert [c["chain"] for c in M.CHAINS] == ["app-owner-to-dynamic-group"], M.CHAINS
+    assert "owns CRM Sync" in wctx["steer_writer"]["g1"], wctx["steer_writer"]
+    assert not M.CHAINS, M.CHAINS
+    # The role check joins the writer segment and the role into one path.
+    got = _run("entra-group-roles",
+               {"idx": w_idx, "dynamic": {"g1"}, "dyn_done": True, "steer_writer": wctx["steer_writer"],
+                "dyn_rules": {"g1": ("Priv", 'user.extension_' + app_id + '_team -eq "red"', "On")}},
+               graph_all=w_graph_all, graph=w_graph, scan_dynamic=lambda ctx: None,
+               dynamic_parents=lambda ctx, gid: set())
+    assert "dynamic-group-holds-role" in got, got
+    paths = [c["path"] for c in M.CHAINS]
+    assert paths and "owns CRM Sync" in paths[0] and "role Global Administrator" in paths[0], paths
+    # A dynamic group nested in a role-holding group inherits the role.
+    def n_graph_all(path, limit=25, beta=False, max_pages=None):
+        if "roleDefinitions" in path:
+            return [{"id": "rd1", "displayName": "Global Administrator",
+                     "rolePermissions": [{"allowedResourceActions": ["microsoft.directory/x/allTasks"]}]}]
+        if "roleAssignments" in path:
+            return [{"principalId": "parent1", "roleDefinitionId": "rd1"}]
+        return []
+    got = _run("entra-group-roles",
+               {"idx": w_idx, "dynamic": {"g1"}, "dyn_done": True, "steer_writer": wctx["steer_writer"],
+                "dyn_rules": {"g1": ("Priv", 'user.department -eq "IT"', "On")}},
+               graph_all=n_graph_all, graph=w_graph, scan_dynamic=lambda ctx: None,
+               dynamic_parents=lambda ctx, gid: {"parent1"})
+    ev = [f["evidence"] for f in M.FINDINGS if f["check"] == "dynamic-group-holds-role"]
+    assert any("viaNestedGroup" in e for e in ev), ev
     reset()
     # A property the API did not return is unknown, never off.
     rows = [{"name": "v", "subscriptionId": subs[0], "soft": "Enabled", "enhanced": "", "immut": ""}]

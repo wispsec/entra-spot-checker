@@ -2881,6 +2881,20 @@ def dynamic_groups(ctx):
     return out
 
 
+def dynamic_parents(ctx, gid):
+    """Group ids that transitively contain gid, or None when the read failed. Cached in ctx."""
+    cache = ctx.setdefault("dyn_parents", {})
+    if gid in cache:
+        return cache[gid]
+    doc = graph("groups/" + str(gid) + "/transitiveMemberOf")
+    if doc is None:
+        cache[gid] = None
+        return None
+    out = {str(dig(m, "id")) for m in lst(dig(doc, "value")) if str(dig(m, "@odata.type")).endswith("group")}
+    cache[gid] = out
+    return out
+
+
 # Who can steer a dynamic rule, from easiest to hardest.
 STEER_ORDER = ("neutral", "guest", "device", "privileged", "fixed")
 STEER_OPEN = ("guest", "device")
@@ -3057,14 +3071,16 @@ def _group_capabilities(ctx, gids):
     if rows is None or defs is None:
         return caps, set(gids)
     roles = {str(dig(d, "id")).split("/")[-1]: (str(dig(d, "name")), lst(dig(d, "perms"))) for d in defs}
+    by_principal = defaultdict(list)
     for r in rows:
-        gid = str(dig(r, "principalId"))
-        if gid not in gids:
-            continue
         name, perms = roles.get(str(dig(r, "roleId")).split("/")[-1], ("", []))
         rank = 3 if grants_role_write(perms) else 2 if any(permits(p, t) for p in perms for t in DANGEROUS_ACTIONS) else 0
         if rank:
-            caps[gid].append((rank, name + " on " + str(dig(r, "scope"))))
+            by_principal[str(dig(r, "principalId"))].append((rank, name + " on " + str(dig(r, "scope"))))
+    for gid in sorted(gids)[:40]:
+        caps[gid].extend(by_principal.get(gid, []))
+        for parent in sorted(dynamic_parents(ctx, gid) or ())[:20]:
+            caps[gid].extend(by_principal.get(parent, []))
     return caps, blind
 
 
@@ -3106,7 +3122,8 @@ def c_dyn(ctx):
             "steer=" + steer + " attrs=" + shown + " grants=" + (",".join(g for _r, g in grants[:3]) or ("not assessed" if gid in blind else "none")) + " rule=" + rule[:80],
             "whoever can steer the rule decides who holds what the group grants")
         if sev in ("critical", "high"):
-            chain("dynamic-group-to-capability", STEER_LABEL[steer] + " -> " + group_node(ctx, gid) + " -> " + grants[0][1], sev, "a rule an outsider can satisfy grants this access")
+            segment = dig(ctx, "steer_writer", {}).get(gid) or STEER_LABEL[steer]
+            chain("dynamic-group-to-capability", segment + " -> " + group_node(ctx, gid) + " -> " + grants[0][1], sev, "a rule an outsider can satisfy grants this access")
 
 
 @check("entra-attribute-writers")
@@ -3148,6 +3165,7 @@ def c_attribute_writers(ctx):
             continue
         examined += 1
         label = name or gid
+        segment = ""
         for attr in attrs:
             kind = attribute_class(attr)
             if not kind:
@@ -3178,19 +3196,22 @@ def c_attribute_writers(ctx):
                     add("high", "schema-extension-steers-role-group", label,
                         "attr=" + attr + " app=" + app_name + " owners=" + ",".join(humans[:3]),
                         "an owner of the application writes the extension for any user, which changes membership")
-                    chain("app-owner-to-dynamic-group",
-                          "user " + humans[0] + " -> owns " + app_name + " -> writes " + attr + " -> " + label,
-                          "high", "an application owner sets the attribute this rule reads")
+                    if not segment:
+                        segment = "user " + humans[0] + " -> owns " + app_name + " -> writes " + attr
                 else:
                     add("info", "schema-extension-writer-unknown", label,
                         "attr=" + attr + " app=" + app_name + " owners=0",
                         "no human owns the application; the writer is whoever holds its credentials")
+                    if not segment:
+                        segment = "credential holder of " + app_name + " -> writes " + attr
             elif kind == "csa":
                 count = holders["Attribute Assignment Administrator"]
                 if count:
                     add("medium", "csa-writer-steers-role-group", label,
                         "attr=" + attr + " attrAssignAdmins=" + str(count),
                         "a holder of Attribute Assignment Administrator sets the value this rule reads")
+                    if not segment:
+                        segment = "Attribute Assignment Administrator holder -> writes " + attr
                 else:
                     add("info", "attribute-writer-unassessed", label,
                         "attr=" + attr + " attrAssignAdmins=0",
@@ -3199,6 +3220,8 @@ def c_attribute_writers(ctx):
                 add("medium", "onprem-attribute-steers-role-group", label,
                     "attr=" + attr + " onPremisesSyncEnabled=yes",
                     "on-premises AD writes the value, so an AD compromise steers membership")
+                if not segment:
+                    segment = "on-premises AD -> writes " + attr
             elif synced is None:
                 undecided("attribute-writer-unassessed", "attr=" + attr, "the sync state of the directory was not read")
             else:
@@ -3206,6 +3229,10 @@ def c_attribute_writers(ctx):
                 add("medium" if count else "info", "user-admin-steers-role-group", label,
                     "attr=" + attr + " userAdmins=" + str(count),
                     "a user administrator writes this attribute; no on-premises writer is present")
+                if not segment:
+                    segment = "user administrator -> writes " + attr
+        if segment:
+            ctx.setdefault("steer_writer", {})[gid] = segment
     note("entra-attribute-writers", examined)
 
 
@@ -3230,6 +3257,10 @@ def c_grouproles(ctx):
         note("entra-group-roles", 0, denied=1)
         return
     note("entra-group-roles", len(assignments))
+    role_of = {}
+    for a in assignments:
+        role_of.setdefault(str(dig(a, "principalId")), defs.get(str(dig(a, "roleDefinitionId"))) or {})
+    segment_of = dig(ctx, "steer_writer", {})
     for a in assignments:
         pid = a.get("principalId")
         d = defs.get(a.get("roleDefinitionId")) or {}
@@ -3237,9 +3268,22 @@ def c_grouproles(ctx):
             sev = "critical" if d.get("writable") else "high"
             name = idx.resolve(pid) or pid
             add(sev, "dynamic-group-holds-role", name, "role=" + str(d.get("name")) + " writable=" + str(d.get("writable")), "rule-based membership decides who holds this role")
-            chain("dynamic-group-to-role", "attribute -> " + str(name) + " -> role " + str(d.get("name")), sev, "a mutable attribute decides role membership")
+            chain("dynamic-group-to-role", segment_of.get(pid, "attribute") + " -> " + str(name) + " -> role " + str(d.get("name")), sev, "a mutable attribute decides role membership")
         elif d.get("writable") and pid in idx.names:
             add("low", "principal-holds-write-role", idx.names[pid], "role=" + str(d.get("name")), "review necessity", "tenant")
+    for gid in sorted(ctx["dynamic"])[:40]:
+        for parent in sorted(dynamic_parents(ctx, gid) or ())[:20]:
+            d = role_of.get(parent)
+            if not d:
+                continue
+            sev = "critical" if dig(d, "writable") else "high"
+            name = idx.resolve(gid) or gid
+            add(sev, "dynamic-group-holds-role", name,
+                "role=" + str(dig(d, "name")) + " viaNestedGroup=" + str(idx.resolve(parent) or parent) + " writable=" + str(dig(d, "writable")),
+                "the dynamic group is nested in a group that holds this role, so its rule decides the role")
+            chain("dynamic-group-to-role",
+                  segment_of.get(gid, "attribute") + " -> " + str(name) + " -> nested in " + str(idx.resolve(parent) or parent) + " -> role " + str(dig(d, "name")),
+                  sev, "a mutable attribute decides role membership through a nested group")
 
 
 SCOPE_NAMES = {}
@@ -10359,7 +10403,10 @@ def run(subs, idx, opts):
     except DatasetUnavailable as exc:
         ctx["dataset_gap"] = str(exc)
     selected = opts["checks"]
-    for name, fn in REGISTRY:
+    # The attribute-writer resolution fills the segment the group chains start from, so it
+    # runs before them. Every other check keeps its declaration order.
+    ordered = sorted(REGISTRY, key=lambda item: 0 if item[0] == "entra-attribute-writers" else 1)
+    for name, fn in ordered:
         if selected and name not in selected:
             COVERAGE[name] = {"examined": 0, "denied": 0, "status": "skipped", "detail": "--check: not selected"}
             continue
