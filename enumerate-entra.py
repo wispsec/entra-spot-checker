@@ -4727,8 +4727,12 @@ def c_authzpolicy(ctx):
     if tlp is None:
         denied_now("entra-authorization-policy")
     for p in lst(tlp):
-        for d in lst(dig(p, "definition")):
-            add("info", "token-lifetime-policy", dig(p, "displayName"), "definition=" + str(d)[:80], "token lifetime override in force", "tenant")
+        for raw in lst(dig(p, "definition")):
+            try:
+                d = json.loads(raw) if isinstance(raw, str) else raw
+            except ValueError:
+                d = {}
+            add("info", "token-lifetime-policy", dig(p, "displayName"), "MaxInactiveTime=" + str(val(dig(d, "MaxInactiveTime"), "unset")) + " definition=" + str(raw)[:70], "token lifetime override in force", "tenant")
     hrd = graph_all("policies/homeRealmDiscoveryPolicies", limit=3)
     if hrd is None:
         note("entra-authorization-policy", 0, denied=1)
@@ -5029,7 +5033,7 @@ DANGEROUS_ACTIONS = (
 
 @check("sub-rbac-write")
 def c_rbac_write(ctx):
-    q = "AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") | project principalId=tostring(properties.principalId), principalType=tostring(properties.principalType), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope)"
+    q = "AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project principalId=tostring(properties.principalId), principalType=tostring(properties.principalType), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope)"
     rows = arg_rows(q, ctx["subs"], scoped=False)
     if rows is None:
         note("sub-rbac-write", 0, denied=1)
@@ -5074,7 +5078,7 @@ def c_guest_rbac(ctx):
     note("sub-guest-rbac", len(guests))
     if not guests:
         return
-    rows = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") | project roleId=tostring(properties.roleDefinitionId), principalId=tostring(properties.principalId), scope=tostring(properties.scope)", ctx["subs"], scoped=False)
+    rows = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project roleId=tostring(properties.roleDefinitionId), principalId=tostring(properties.principalId), scope=tostring(properties.scope)", ctx["subs"], scoped=False)
     if rows is None:
         note("sub-guest-rbac", len(guests), denied=1)
         return
@@ -5096,7 +5100,7 @@ def c_guest_rbac(ctx):
 
 @check("sub-custom-roles")
 def c_custom_arm(ctx):
-    rows = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roledefinitions' | where tostring(properties.roleType) == 'CustomRole' | where subscriptionId in (" + subq(ctx["subs"]) + ") | project name, subscriptionId, id, perms=properties.permissions", ctx["subs"], scoped=False)
+    rows = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roledefinitions' | where tostring(properties.roleType) == 'CustomRole' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project name, subscriptionId, id, perms=properties.permissions", ctx["subs"], scoped=False)
     if rows is None:
         note("sub-custom-roles", 0, denied=1)
         return
@@ -5616,7 +5620,7 @@ def c_mg(ctx):
 
 @check("sub-azure-pim")
 def c_azure_pim(ctx):
-    q = "AuthorizationResources | where type =~ 'microsoft.authorization/roleeligibilityschedules' | where subscriptionId in (" + subq(ctx["subs"]) + ") | project name, subscriptionId, principalId=tostring(properties.principalId)"
+    q = "AuthorizationResources | where type =~ 'microsoft.authorization/roleeligibilityschedules' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project name, subscriptionId, principalId=tostring(properties.principalId)"
     rows = arg_rows(q, ctx["subs"], scoped=False)
     if rows is None:
         note("sub-azure-pim", 0, denied=1)
@@ -6703,7 +6707,7 @@ def c_device_compliance(ctx):
 def c_priv_roles(ctx):
     q = """AuthorizationResources
 | where type =~ 'microsoft.authorization/roleassignments'
-| where subscriptionId in (""" + subq(ctx["subs"]) + """)
+| where subscriptionId in (""" + subq(ctx["subs"]) + """) or isempty(tostring(subscriptionId))
 | project principalId=tostring(properties.principalId), principalType=tostring(properties.principalType), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope)"""
     rows = arg_rows(q, ctx["subs"], scoped=False)
     if rows is None:
@@ -7111,7 +7115,7 @@ def c_appgw(ctx):
 
 @check("sub-rbac-scope-breadth")
 def c_rbac_breadth(ctx):
-    rows = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") | project principalId=tostring(properties.principalId), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope), subscriptionId", ctx["subs"], scoped=False)
+    rows = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project principalId=tostring(properties.principalId), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope), subscriptionId", ctx["subs"], scoped=False)
     if rows is None:
         note("sub-rbac-scope-breadth", 0, denied=1)
         return
@@ -8989,7 +8993,7 @@ def c_la_depth(ctx):
 
 @check("sub-access-reviews-rbac")
 def c_reviews_rbac(ctx):
-    rows = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/accessreviewscheduledefinitions' | where subscriptionId in (" + subq(ctx["subs"]) + ") | project name, subscriptionId, scope=tostring(properties.scope), recurrence=tostring(properties.settings.recurrence), auto=tostring(properties.settings.autoApplyDecisionsEnabled)", ctx["subs"], scoped=False)
+    rows = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/accessreviewscheduledefinitions' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project name, subscriptionId, scope=tostring(properties.scope), recurrence=tostring(properties.settings.recurrence), auto=tostring(properties.settings.autoApplyDecisionsEnabled)", ctx["subs"], scoped=False)
     if rows is None:
         note("sub-access-reviews-rbac", 0, denied=1)
         return
@@ -9617,7 +9621,7 @@ def c_nsg_precedence(ctx):
 
 @check("sub-policy-parameter-effect")
 def c_policy_params(ctx):
-    rows = arg_rows("PolicyResources | where type =~ 'microsoft.authorization/policyassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") | project name, subscriptionId, effect=tostring(properties.parameters.effect.value), enforcement=tostring(properties.enforcementMode), notScopes=properties.notScopes", ctx["subs"], scoped=False)
+    rows = arg_rows("PolicyResources | where type =~ 'microsoft.authorization/policyassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | project name, subscriptionId, effect=tostring(properties.parameters.effect.value), enforcement=tostring(properties.enforcementMode), notScopes=properties.notScopes", ctx["subs"], scoped=False)
     if rows is None:
         note("sub-policy-parameter-effect", 0, denied=1)
         return
@@ -10015,7 +10019,7 @@ def c_xtenant_escalation(ctx):
         chain("local-admin-to-customer-tenant", "this tenant -> GDAP -> " + label, "high", "blast radius includes the customer tenant")
     if ctx["subs"]:
         lh = arg_rows("Resources | where type =~ 'microsoft.managedservices/registrationdefinitions' | project name, subscriptionId, props=properties", ctx["subs"])
-        lap = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") | where tostring(properties.principalType) == 'ForeignGroup' | project name, subscriptionId, principalId=tostring(properties.principalId), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope)", ctx["subs"], scoped=False)
+        lap = arg_rows("AuthorizationResources | where type =~ 'microsoft.authorization/roleassignments' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | where tostring(properties.principalType) == 'ForeignGroup' | project name, subscriptionId, principalId=tostring(properties.principalId), roleId=tostring(properties.roleDefinitionId), scope=tostring(properties.scope)", ctx["subs"], scoped=False)
         lh = unread(lh, "Lighthouse registrations", "cross-tenant-lighthouse-unreadable")
         lap = unread(lap, "foreign-principal Azure RBAC", "cross-tenant-rbac-unreadable")
         blind = blind or lh is None or lap is None
