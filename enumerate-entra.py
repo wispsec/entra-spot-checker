@@ -816,6 +816,15 @@ def val(value, default=None):
     return default if value is MISSING or value is None else value
 
 
+def as_map(value):
+    """A dict, or an empty dict when the value is absent, MISSING or another type.
+
+    A chained .get() on a dig() result is a crash when the path is absent: dig
+    returns the MISSING sentinel, not a dict.
+    """
+    return value if isinstance(value, dict) else {}
+
+
 DATASET_NOTED = {"done": False}
 
 
@@ -1217,6 +1226,7 @@ FRAMEWORK = {
     "implicit-access-token": ("CWE-522", "APP-"),
     "implicit-id-token": ("CWE-522", "APP-"),
     "management-group-owner": ("CWE-269", "ID-"),
+    "mg-chain-unreadable": ("CWE-1059", "GOV-"),
     "azure-lighthouse-delegation": ("CWE-284", "ID-"),
     "classic-coadministrator": ("CWE-269", "ID-"),
     "keyvault-open-network": ("CWE-284", "KV-"),
@@ -1975,13 +1985,20 @@ SUFFIX_CATEGORY = {"co", "com", "org", "net", "ac", "gov", "edu", "or", "ne", "g
 
 
 def consent_breadth(value):
-    """Breadth of a permissionGrantPoliciesAssigned value: broad, restricted or custom.
+    """Breadth of an assigned consent policy list: broad, restricted, custom or unset.
 
-    An unset value leaves the historical default in force, which lets a user consent
-    to any permission. A value naming a policy this run did not read is custom.
+    The list holds ManagePermissionGrantsForSelf.microsoft-user-default-low for the
+    restricted built-in, ...-legacy for the broad one, and a policy id for a custom
+    one. An empty list assigns no policy, which denies user consent. A field the
+    response did not carry is not an empty list and draws no verdict.
     """
-    text = str(val(value, "")).lower()
-    if not text or CONSENT_LEGACY in text:
+    if value is MISSING:
+        return "unset"
+    items = value if isinstance(value, list) else ([value] if value else [])
+    text = " ".join(str(i) for i in items).lower()
+    if not items:
+        return "restricted"
+    if CONSENT_LEGACY in text:
         return "broad"
     if CONSENT_RESTRICTED in text:
         return "restricted"
@@ -3175,8 +3192,10 @@ def _steer_term(attr, op, value, guarded):
 def group_node(ctx, gid):
     """Chain label for a dynamic group. The id suffix keeps two groups that share a
     display name apart in the dot graph."""
-    name = (dig(ctx, "dyn_rules", None) or {}).get(gid, ("",))[0]
-    return "group " + (name or gid) + " (" + str(gid)[:8] + ")"
+    name = (as_map(dig(ctx, "dyn_rules")).get(gid) or ("",))[0]
+    if name:
+        return "group " + str(name) + " (" + str(gid)[:8] + ")"
+    return "group " + str(gid)
 
 
 def _group_capabilities(ctx, gids):
@@ -3265,7 +3284,7 @@ def c_dyn(ctx):
             "steer=" + steer + " attrs=" + shown + " grants=" + (",".join(g for _r, g in grants[:3]) or ("not assessed" if gid in blind else "none")) + " rule=" + rule[:80],
             "whoever can steer the rule decides who holds what the group grants")
         if sev in ("critical", "high"):
-            segment = dig(ctx, "steer_writer", {}).get(gid) or STEER_LABEL[steer]
+            segment = as_map(dig(ctx, "steer_writer")).get(gid) or STEER_LABEL[steer]
             for rank, sink in grants[:3]:
                 if steer in STEER_OPEN:
                     sink_sev = ("low", "medium", "high", "critical")[rank]
@@ -3406,7 +3425,7 @@ def c_grouproles(ctx):
             actions.extend(perm.get("allowedResourceActions") or [])
         if not r.get("id"):
             continue
-        defs[r["id"]] = {"name": r.get("displayName"), "writable": any(not a.endswith("/read") for a in actions)}
+        defs[role_guid(r["id"])] = {"name": r.get("displayName"), "writable": any(not a.endswith("/read") for a in actions)}
     assignments = graph_all("roleManagement/directory/roleAssignments", limit=5)
     if assignments is None:
         note("entra-group-roles", 0, denied=1)
@@ -3414,12 +3433,12 @@ def c_grouproles(ctx):
     note("entra-group-roles", len(assignments))
     role_of = {}
     for a in assignments:
-        role_of.setdefault(str(dig(a, "principalId")), defs.get(str(dig(a, "roleDefinitionId"))) or {})
+        role_of.setdefault(str(dig(a, "principalId")), defs.get(role_guid(dig(a, "roleDefinitionId"))) or {})
     ctx["group_roles"] = role_of
-    segment_of = dig(ctx, "steer_writer", {})
+    segment_of = as_map(dig(ctx, "steer_writer"))
     for a in assignments:
         pid = a.get("principalId")
-        d = defs.get(a.get("roleDefinitionId")) or {}
+        d = defs.get(role_guid(a.get("roleDefinitionId"))) or {}
         if pid in ctx["dynamic"]:
             sev = "critical" if d.get("writable") else "high"
             name = idx.resolve(pid) or pid
@@ -3573,9 +3592,9 @@ def c_ca(ctx):
         if state == "enabledForReportingButNotEnforced":
             add("high", "ca-policy-report-only", name, "state=report-only", "control documented but not enforced")
         for gid in users.get("excludeGroups") or []:
-            steer = dig(ctx, "dyn", {}).get(gid)
+            steer = as_map(dig(ctx, "dyn")).get(gid)
             if enforced and steer in STEER_OPEN + ("privileged",):
-                glabel = (dig(ctx, "dyn_rules", None) or {}).get(gid, (gid,))[0] or gid
+                glabel = (as_map(dig(ctx, "dyn_rules")).get(gid) or (gid,))[0] or gid
                 sev = "high" if steer in STEER_OPEN else "medium"
                 add(sev, "ca-exclusion-dynamic-group", name, "excludeGroups includes " + glabel + " steer=" + steer, "rule-based membership removes the control")
                 if sev == "high":
@@ -3616,12 +3635,14 @@ def c_ca(ctx):
         if gc.get("operator") == "OR" and len(builtins) > 1:
             add("medium", "ca-grant-operator-or", name, "operator=OR controls=" + ",".join(builtins), "any single control satisfies the policy")
         sid = (gc.get("authenticationStrength") or {}).get("id")
-        if sid and strengths is None:
-            undecided("ca-strength-unread", "policy=" + str(name), "the custom strength of this policy was not assessed")
-        elif sid:
-            disp, combos = strengths.get(sid, (str(sid), []))
-            single = [c for c in combos if "SingleFactor" in c]
-            add("medium" if single else "info", "ca-auth-strength", name, "strength=" + str(disp) + " combos=" + ",".join(combos)[:60], "custom authentication strength; verify the combinations")
+        if sid:
+            if strengths is None:
+                undecided("ca-strength-unread", "policy=" + str(name), "the custom strength of this policy was not assessed")
+            else:
+                found = strengths.get(sid)
+                disp, combos = found if found else (str(sid), [])
+                single = [c for c in combos if "SingleFactor" in c]
+                add("medium" if single else "info", "ca-auth-strength", name, "strength=" + str(disp) + " combos=" + ",".join(combos)[:60], "custom authentication strength; verify the combinations")
     if pols and not ca_complete():
         capped(CURRENT["check"], len(pols), "conditional access policy pages")
     if ca_complete() and not restricts_flows:
@@ -3731,8 +3752,8 @@ def c_stale_priv(ctx):
     if def_rows is None or asg_rows is None:
         note("entra-stale-privileged", 0, denied=1)
         return
-    def_objs = {d.get("id"): d for d in def_rows if d.get("id")}
-    holders = {a.get("principalId") for a in asg_rows if is_escalation(def_objs.get(a.get("roleDefinitionId")))}
+    def_objs = {role_guid(d.get("id")): d for d in def_rows if d.get("id")}
+    holders = {a.get("principalId") for a in asg_rows if is_escalation(def_objs.get(role_guid(a.get("roleDefinitionId"))))}
     if not holders:
         note("entra-stale-privileged", 0)
         return
@@ -3898,6 +3919,30 @@ ROLE_TEMPLATE_IDS = {
 }
 
 
+def role_guid(value):
+    """Bare role definition GUID.
+
+    A role definition id is the bare GUID in roleAssignments and the schedule
+    objects, and a path in some policy objects. Normalising both sides of a join
+    makes the join correct under either shape.
+    """
+    return str(val(value, "")).split("/")[-1].lower()
+
+
+def standing_assignment(obj):
+    """Whether an active schedule instance is a standing assignment.
+
+    roleAssignmentScheduleInstance.assignmentType is Permanent, Limited or OneTime.
+    An instance that names no end time is standing whatever the label says.
+    """
+    kind = str(val(dig(obj, "assignmentType"), "")).lower()
+    if kind in ("permanent", "assigned"):
+        return True
+    if kind in ("limited", "one_time", "onetime"):
+        return False
+    return dig(obj, "endDateTime") in (MISSING, None)
+
+
 def is_escalation(role):
     template = str((role or {}).get("templateId") or "").lower()
     if template in ROLE_TEMPLATE_IDS:
@@ -3920,7 +3965,7 @@ def c_escalation(ctx):
     if defs is None:
         note("entra-escalation-roles", 0, denied=1)
         return
-    privileged = {d.get("id"): d for d in defs if d.get("id") and is_escalation(d)}
+    privileged = {role_guid(d.get("id")): d for d in defs if d.get("id") and is_escalation(d)}
     assignments = graph_all("roleManagement/directory/roleAssignments", limit=5)
     if assignments is None:
         note("entra-escalation-roles", 0, denied=1)
@@ -3928,14 +3973,14 @@ def c_escalation(ctx):
     note("entra-escalation-roles", len(assignments))
     holders = defaultdict(list)
     for a in assignments:
-        rid = a.get("roleDefinitionId")
-        if rid in privileged:
-            holders[rid].append(a.get("principalId"))
-    for rid, pids in holders.items():
-        role_def = privileged.get(rid) or {}
+        role_id = role_guid(a.get("roleDefinitionId"))
+        if role_id in privileged:
+            holders[role_id].append(a.get("principalId"))
+    for role_id, pids in holders.items():
+        role_def = privileged.get(role_id) or {}
         template = str(role_def.get("templateId") or "").lower()
         critical = template in ("62e90394-69f5-4237-9190-012177145e10", "e8611ab8-c189-46e8-94e1-60213ab1f814", "7be44c8a-adaf-4e2a-84d6-ab2649e08a13", "8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2")
-        add("critical" if critical else "high", "escalation-role-holders", str(role_def.get("displayName") or rid), "holders=" + str(len(pids)) + " first=" + str(ctx["idx"].resolve(pids[0]) or pids[0]), "this role leads to app takeover, credential reset, or full control")
+        add("critical" if critical else "high", "escalation-role-holders", str(role_def.get("displayName") or role_id), "holders=" + str(len(pids)) + " first=" + str(ctx["idx"].resolve(pids[0]) or pids[0]), "this role leads to app takeover, credential reset, or full control")
 
 
 @check("entra-graph-permissions")
@@ -4032,9 +4077,9 @@ def c_pim_depth(ctx):
         return
     perm = Counter()
     for a in active:
-        if str(a.get("assignmentType")) == "Assigned":
-            perm[a.get("roleDefinitionId")] += 1
-    eligible_ids = {e.get("roleDefinitionId") for e in elig}
+        if standing_assignment(a):
+            perm[role_guid(a.get("roleDefinitionId"))] += 1
+    eligible_ids = {role_guid(e.get("roleDefinitionId")) for e in elig}
     for rid, cnt in perm.items():
         if rid not in eligible_ids:
             add("medium", "role-permanent-no-eligible-path", rid, "permanent=" + str(cnt), "no PIM path exists for this role; every holder is standing")
@@ -4802,12 +4847,15 @@ def c_authzpolicy(ctx):
         add("medium", "guest-role-unknown", "tenant", "guestUserRoleId=" + (gur or "unset"), "the guest permission level is not one of the three documented roles")
     if pol.get("blockMsolPowerShell") is False:
         add("low", "msol-powershell-allowed", "tenant", "blockMsolPowerShell=false", "legacy MSOnline path remains available")
-    assigned = lst(dig(pol, "permissionGrantPolicyIdsAssignedToDefaultUserRole"))
-    breadth = consent_breadth(",".join(str(a) for a in assigned))
+    assigned = dig(pol, "permissionGrantPolicyIdsAssignedToDefaultUserRole")
+    shown = ",".join(str(a) for a in lst(assigned))
+    breadth = consent_breadth(assigned)
     if breadth == "broad":
-        add("high", "user-consent-to-apps-enabled", "tenant", "permissionGrantPolicyIdsAssignedToDefaultUserRole=" + (",".join([str(a) for a in assigned][:4]) or "unset"), "users can grant app permissions without an administrator")
+        add("high", "user-consent-to-apps-enabled", "tenant", "permissionGrantPolicyIdsAssignedToDefaultUserRole=" + (shown[:120] or "unset"), "users can grant app permissions without an administrator")
+    elif breadth == "unset":
+        undecided("user-consent-policy-unresolved", "permissionGrantPolicyIdsAssignedToDefaultUserRole not returned", "the field is absent, so the consent breadth is unknown")
     elif breadth == "custom":
-        undecided("user-consent-policy-unresolved", "assigned=" + ",".join(str(a) for a in assigned)[:80], "a grant policy is assigned but was not read, so the consent breadth is unknown")
+        undecided("user-consent-policy-unresolved", "assigned=" + shown[:80], "a grant policy is assigned but was not read, so the consent breadth is unknown")
     if d.get("allowedToCreateTenants"):
         add("medium", "users-can-create-tenants", "tenant", "defaultUserRolePermissions.allowedToCreateTenants=true", "users can create tenants outside the governance boundary")
     if d.get("allowedToReadBitlockerKeysForOwnedDevice"):
@@ -5055,11 +5103,11 @@ def c_guest_roles(ctx):
                       "directory role definitions", "guest-roles-unreadable")
     if defs_raw is None:
         return
-    defs = {d.get("id"): d.get("displayName") for d in defs_raw if d.get("id")}
+    defs = {role_guid(d.get("id")): d.get("displayName") for d in defs_raw if d.get("id")}
     note("entra-guests-with-roles", len(assignments), denied=deny("entra-guests-with-roles", 0))
     for a in assignments:
         if a.get("principalId") in guests:
-            label = str(defs.get(a.get("roleDefinitionId")) or a.get("roleDefinitionId"))
+            label = str(defs.get(role_guid(a.get("roleDefinitionId"))) or a.get("roleDefinitionId"))
             sev = "critical" if label in ESCALATION_ROLES else "high"
             add(sev, "guest-holds-directory-role", str(a.get("principalId")), "role=" + label, "external identity holds a directory role")
 
@@ -5076,7 +5124,8 @@ def c_customroles(ctx):
         for perm in r.get("rolePermissions") or []:
             actions.extend(perm.get("allowedResourceActions") or [])
         wild = [a for a in actions if a.endswith("allTasks") or a == "*" or "allProperties" in a]
-        escalation = [a for a in actions if any(t in str(a).lower() for t in ESCALATION_ACTIONS)]
+        escalation = [a for a in actions if not str(a).lower().endswith(("/read", "/list"))
+                      and any(t in str(a).lower() for t in ESCALATION_ACTIONS)]
         if wild:
             add("high", "custom-role-broad-actions", dig(r, "displayName"), "actions=" + str(len(actions)) + " broad=" + ",".join(wild[:4]), "custom role grants near-administrative breadth")
         if escalation:
@@ -5418,14 +5467,19 @@ def c_synced_admins(ctx):
             synced.add(u.get("id"))
     note("entra-synced-admins", len(synced))
     assignments = graph_all("roleManagement/directory/roleAssignments", limit=5)
-    if assignments is None:
+    defs = graph_all("roleManagement/directory/roleDefinitions", limit=5)
+    if assignments is None or defs is None:
         note("entra-synced-admins", len(synced), denied=1)
         return
     if not synced:
         return
+    privileged = {role_guid(dig(d, "id")): d for d in defs if is_escalation(d)}
     for a in assignments:
-        if a.get("principalId") in synced:
-            add("high", "synced-account-holds-role", idx.resolve(a.get("principalId")) or a.get("principalId"), "role=" + str(a.get("roleDefinitionId")), "on-premises write access reaches a cloud administrative role")
+        role = privileged.get(role_guid(a.get("roleDefinitionId")))
+        if role is None or a.get("principalId") not in synced:
+            continue
+        label = str(val(dig(role, "displayName"), dig(a, "roleDefinitionId")))
+        add("high", "synced-account-holds-role", idx.resolve(a.get("principalId")) or a.get("principalId"), "role=" + label, "an identity provisioned from the on-premises directory holds a privileged cloud role")
 
 
 @check("entra-password-policy")
@@ -6893,12 +6947,15 @@ def c_pim_settings(ctx):
         return
     roles = [d for d in defs if is_escalation(d)]
     note("entra-pim-role-settings", len(roles))
+    pols = graph_all("policies/roleManagementPolicyAssignments?$filter=scopeId eq '/' and scopeType eq 'Directory'&$expand=policy($expand=rules)", limit=5, beta=True)
+    if pols is None:
+        note("entra-pim-role-settings", len(roles), denied=1)
+        return
+    by_role = {}
+    for a in pols:
+        by_role.setdefault(role_guid(a.get("roleDefinitionId")), []).append(a)
     for r in roles[:8]:
-        pol = graph("policies/roleManagementPolicyAssignments?$filter=roleDefinitionId eq '" + str(r.get("id")) + "' and scopeId eq '/'&$expand=policy($expand=rules)", beta=True)
-        if pol is None:
-            deny("entra-pim-role-settings")
-            continue
-        for a in pol.get("value") or []:
+        for a in by_role.get(role_guid(r.get("id")), []):
             rules = (a.get("policy") or {}).get("rules") or []
             approval = any("Approval" in str(x.get("@odata.type")) for x in rules)
             authctx = any("AuthenticationContext" in str(x.get("@odata.type")) for x in rules)
@@ -7341,7 +7398,9 @@ def c_policy_coverage(ctx):
                         chain_raw = json.loads(chain_raw) if chain_raw.strip() else []
                     except ValueError:
                         chain_raw = []
-                inherited[str(dig(h, "id"))] = {str(dig(a, "name")).lower() for a in lst(chain_raw)}
+                names = {str(dig(a, "name")).lower() for a in lst(chain_raw)}
+                if names:
+                    inherited[str(dig(h, "id"))] = names
     for s in ctx["subs"]:
         direct = len([r for r in rows if str(dig(r, "subscriptionId")) == s or s in str(dig(r, "scope"))])
         if direct:
@@ -7919,13 +7978,19 @@ def c_dormant_guests(ctx):
         return
     note("entra-dormant-guests", len(guests))
     cutoff = time.time() - 90 * 86400
+    unread = 0
     for g in guests:
-        act = g.get("signInActivity") or {}
-        last = str(act.get("lastSignInDateTime") or "")
+        act = dig(g, "signInActivity")
+        if act is MISSING:
+            unread += 1
+            continue
+        last = str(val(dig(act, "lastSignInDateTime"), ""))
         if not last:
             add("medium", "guest-never-signed-in", g.get("userPrincipalName"), "created=" + str(g.get("createdDateTime")), "guest object exists with no sign-in record")
         elif (_stamp(last) or 0.0) < cutoff:
             add("low", "guest-dormant", g.get("userPrincipalName"), "lastSignIn=" + last, "external identity unused for more than 90 days")
+    if unread:
+        undecided("guest-activity-unread", "guests=" + str(unread), "signInActivity was not returned for these guests, so dormancy is not graded")
 
 
 @check("entra-deleted-service-principals")
@@ -8495,7 +8560,7 @@ def c_standing_ga(ctx):
     if defs is None:
         note("entra-standing-global-admin", 0, denied=1)
         return
-    ga = {str(dig(d, "id")) for d in defs if str(dig(d, "templateId") or "").lower() == "62e90394-69f5-4237-9190-012177145e10"}
+    ga = {role_guid(dig(d, "id")) for d in defs if str(dig(d, "templateId") or "").lower() == "62e90394-69f5-4237-9190-012177145e10"}
     if not ga:
         note("entra-standing-global-admin", 0, denied=1)
         add("low", "standing-ga-template-unresolved", "tenant", "roleDefinitions=" + str(len(defs)) + " globalAdminTemplates=0", "the Global Administrator role definition is not in the response, so permanent assignments cannot be identified")
@@ -8505,10 +8570,10 @@ def c_standing_ga(ctx):
         note("entra-standing-global-admin", 0, denied=1)
         add("info", "standing-ga-unreadable", "tenant", "schedule instances unavailable", "permanent Global Administrator holds cannot be listed")
         return
-    standing = [i for i in inst if str(dig(i, "roleDefinitionId")) in ga and str(dig(i, "assignmentType")) == "Assigned"]
+    standing = [i for i in inst if role_guid(dig(i, "roleDefinitionId")) in ga and standing_assignment(i)]
     note("entra-standing-global-admin", len(inst))
     for i in standing:
-        add("high", "standing-global-administrator", str(dig(i, "principalId")), "assignmentType=Assigned end=" + str(dig(i, "endDateTime")), "Global Administrator is permanently assigned, with no activation gate")
+        add("high", "standing-global-administrator", str(dig(i, "principalId")), "assignmentType=" + str(val(dig(i, "assignmentType"), "unlabelled")) + " end=" + str(val(dig(i, "endDateTime"), "none")), "Global Administrator is permanently assigned, with no activation gate")
     if not standing:
         add("info", "no-standing-global-administrator", "tenant", "instances=" + str(len(inst)), "no permanently assigned Global Administrator in the schedule view")
 
@@ -8970,7 +9035,7 @@ def c_xtp(ctx):
             add("low", "xtenant-outbound-open", name, "b2bCollaborationOutbound=" + oa, "users may be invited into the partner tenant")
         trust = dig(p, "automaticUserConsentSettings.inboundAllowed")
         if trust is True:
-            add("high", "xtenant-inbound-trust", name, "automaticUserConsentSettings.inboundAllowed=true", "users from this tenant are trusted without MFA prompts or consent")
+            add("high", "xtenant-inbound-trust", name, "automaticUserConsentSettings.inboundAllowed=true", "identities from this partner are consented automatically without an administrator approving each one")
 
 
 @check("entra-terms-of-use")
@@ -9042,16 +9107,18 @@ def c_consent_policy(ctx):
     note("entra-consent-grant-policy", len(rows))
     if not rows:
         authz = graph("policies/authorizationPolicy")
-        default = str(val(dig(authz, "defaultUserRolePermissions.permissionGrantPoliciesAssigned"), ""))
+        assigned = dig(authz, "defaultUserRolePermissions.permissionGrantPoliciesAssigned")
+        shown = ",".join(str(a) for a in lst(assigned))
+        breadth = consent_breadth(assigned)
         if authz is None:
             denied_now("entra-consent-grant-policy")
             add("low", "consent-policy-unreadable", "tenant", "0 grant policies and authorizationPolicy unreadable", "user consent restriction cannot be assessed")
-        elif consent_breadth(default) == "broad":
-            add("high", "no-consent-grant-policy", "tenant", "grantPolicies=0 defaultUserRolePermissions=" + (default or "unset"), "users can consent to any application permission")
-        elif consent_breadth(default) == "restricted":
-            add("info", "consent-restricted-by-default", "tenant", "defaultUserRolePermissions.permissionGrantPoliciesAssigned=" + default, "the built-in default restricts user consent")
+        elif breadth == "broad":
+            add("high", "no-consent-grant-policy", "tenant", "grantPolicies=0 permissionGrantPoliciesAssigned=" + (shown[:120] or "unset"), "users can consent to any application permission")
+        elif breadth == "restricted":
+            add("info", "consent-restricted-by-default", "tenant", "permissionGrantPoliciesAssigned=" + (shown[:120] or "empty list"), "user consent is restricted or disabled by the default grant policy")
         else:
-            undecided("consent-policy-unresolved", "grantPolicies=0 assigned=" + default[:80], "the assigned grant policy was not read, so the consent breadth is unknown")
+            undecided("consent-policy-unresolved", "grantPolicies=0 assigned=" + (shown[:80] or "not returned"), "the assigned grant policy was not read, so the consent breadth is unknown")
         return
     for p in rows:
         rules = lst(dig(p, "includes"))
@@ -9647,21 +9714,37 @@ def c_kv_contacts(ctx):
         return
     note("sub-kv-cert-contacts", min(len(vaults), 10))
     sample("sub-kv-cert-contacts", min(len(vaults), 10), len(vaults), "vaults")
+    seen = 0
+    unread = 0
     for v in vaults[:10]:
         s = str(dig(v, "subscriptionId"))
-        url = ARM_BASE + "/subscriptions/" + s + "/resourceGroups/" + str(dig(v, "rg")) + "/providers/Microsoft.KeyVault/vaults/" + str(dig(v, "name")) + "/certificates?api-version=2023-07-01"
+        base = ARM_BASE + "/subscriptions/" + s + "/resourceGroups/" + str(dig(v, "rg")) + "/providers/Microsoft.KeyVault/vaults/" + str(dig(v, "name"))
+        url = base + "/certificates?api-version=2023-07-01"
         LAST_QUERY[CURRENT["check"]] = "az rest --url " + repr(url)
         doc = arm(url)
         if doc is None:
             denied_now("sub-kv-cert-contacts")
             continue
-        certs = lst(dig(doc, "value"))
-        for c in certs:
-            policy = dig(c, "properties.policy") or dig(c, "policy")
+        for c in lst(dig(doc, "value")):
+            if seen >= 25:
+                break
+            seen += 1
+            cert = str(dig(c, "id")).split("/")[-1]
+            purl = base + "/certificates/" + cert + "/policy?api-version=2023-07-01"
+            LAST_QUERY[CURRENT["check"]] = "az rest --url " + repr(purl)
+            policy = arm(purl)
+            if policy is None:
+                unread += 1
+                continue
             lifetime = lst(dig(policy, "lifetimeActions"))
             auto = any(str(dig(dig(a, "action"), "actionType")).lower() == "autorenew" for a in lifetime)
             if not auto:
-                add("medium", "kv-cert-no-autorenew", str(dig(v, "name")) + "/" + str(dig(c, "id")).split("/")[-1], "lifetimeActions without AutoRenew", "the certificate expires without renewal", s)
+                add("medium", "kv-cert-no-autorenew", str(dig(v, "name")) + "/" + cert, "lifetimeActions without AutoRenew", "the certificate expires without renewal", s)
+    if unread:
+        deny("sub-kv-cert-contacts")
+        add("low", "kv-cert-policy-unreadable", "certificates=" + str(unread), "issuance policy unreadable", "renewal configuration cannot be graded for these certificates")
+    if seen >= 25:
+        capped(CURRENT["check"], seen, "certificates")
 
 
 @check("sub-defender-plan-coverage")
@@ -10101,9 +10184,14 @@ def c_mg_default(ctx):
         note("sub-mg-default-membership", 0, denied=1)
         return
     note("sub-mg-default-membership", len(rows))
+    chains = {str(dig(r, "id")): lst(dig(r, "chain")) for r in rows}
+    if rows and not any(chains.values()):
+        add("low", "mg-chain-unreadable", "all", "subscriptions=" + str(len(rows)) + " withAncestry=0", "the management group ancestry was not returned, so root placement is not graded")
+        return
     for r in rows:
-        chain = lst(dig(r, "chain"))
-        names = [str(dig(c, "name")) for c in chain]
+        names = [str(dig(c, "name")) for c in chains.get(str(dig(r, "id")), [])]
+        if not names:
+            continue
         if len(names) <= 1:
             parts = str(dig(r, "id")).split("/")
             sub_id = parts[2] if len(parts) > 2 else "unknown"
@@ -10146,7 +10234,7 @@ def c_pim_standing(ctx):
     if defs is None or active is None:
         note("entra-pim-standing-roles", 0, denied=1)
         return
-    privileged = {str(dig(d, "id")): d for d in defs if is_escalation(d)}
+    privileged = {role_guid(dig(d, "id")): d for d in defs if is_escalation(d)}
     note("entra-pim-standing-roles", len(active))
     eligible_pairs = set()
     eligible_ok = eligible is not None
@@ -10154,21 +10242,20 @@ def c_pim_standing(ctx):
         denied_now("entra-pim-standing-roles")
         add("low", "pim-eligibility-unreadable", "tenant", "roleEligibilityScheduleInstances unavailable", "permanent and eligible grants cannot be distinguished")
     else:
-        eligible_pairs = {(str(dig(e, "principalId")), str(dig(e, "roleDefinitionId"))) for e in eligible}
+        eligible_pairs = {(str(dig(e, "principalId")), role_guid(dig(e, "roleDefinitionId"))) for e in eligible}
     counts = Counter()
     for a in active:
-        rid = str(dig(a, "roleDefinitionId"))
-        if rid not in privileged:
+        role_id = role_guid(dig(a, "roleDefinitionId"))
+        if role_id not in privileged:
             continue
         pid = str(dig(a, "principalId"))
-        kind = str(val(dig(a, "assignmentType"), "unknown")).lower()
-        counts[rid] += 1
-        if kind == "assigned" and eligible_ok and (pid, rid) not in eligible_pairs:
-            role = privileged[rid]
-            add("high", "standing-privileged-role", str(val(dig(role, "displayName"), rid)), "principal=" + pid + " assignmentType=Assigned noEligibility", "the role is held permanently with no activation path")
-    for rid, role in privileged.items():
-        if not counts.get(rid):
-            add("info", "privileged-role-unheld", str(val(dig(role, "displayName"), rid)), "activeAssignments=0", "no standing holder for this role")
+        counts[role_id] += 1
+        if standing_assignment(a) and eligible_ok and (pid, role_id) not in eligible_pairs:
+            role = privileged[role_id]
+            add("high", "standing-privileged-role", str(val(dig(role, "displayName"), role_id)), "principal=" + pid + " assignmentType=" + str(val(dig(a, "assignmentType"), "unlabelled")) + " noEligibility", "the role is held permanently with no activation path")
+    for role_id, role in privileged.items():
+        if not counts.get(role_id):
+            add("info", "privileged-role-unheld", str(val(dig(role, "displayName"), role_id)), "activeAssignments=0", "no standing holder for this role")
 
 
 @check("entra-access-review-guest-scope")
@@ -10584,8 +10671,8 @@ def c_ga_count(ctx):
     if defs is None or asg is None:
         note("entra-global-admin-count", 0, denied=1)
         return
-    ga = {str(dig(d, "id")) for d in defs if str(val(dig(d, "templateId"), "")).lower() == "62e90394-69f5-4237-9190-012177145e10"}
-    holders = [str(dig(a, "principalId")) for a in asg if str(dig(a, "roleDefinitionId")) in ga]
+    ga = {role_guid(dig(d, "id")) for d in defs if str(val(dig(d, "templateId"), "")).lower() == "62e90394-69f5-4237-9190-012177145e10"}
+    holders = [str(dig(a, "principalId")) for a in asg if role_guid(dig(a, "roleDefinitionId")) in ga]
     note("entra-global-admin-count", len(holders))
     if not holders:
         add("medium", "no-global-administrator", "tenant", "0 assignments", "no verified administrative path")

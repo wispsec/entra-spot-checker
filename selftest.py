@@ -52,6 +52,24 @@ def invariants():
     assert M._owner(None, "name-only", "tenant") == ""
     assert M._owner("explicit", "name-only", "tenant") == "explicit"
     M.HOME_TENANT["id"] = ""
+    # A role definition id is a bare GUID or a path; the join normalises both sides.
+    assert M.role_guid("/roleManagement/directory/roleDefinitions/AB") == "ab"
+    assert M.role_guid("AB") == "ab"
+    assert M.role_guid(None) == ""
+    # A standing grant names no end time, whatever the assignment label.
+    assert M.standing_assignment({"assignmentType": "Permanent"}) is True
+    assert M.standing_assignment({"assignmentType": "Limited", "endDateTime": "x"}) is False
+    assert M.standing_assignment({"endDateTime": None}) is True
+    assert M.standing_assignment({"assignmentType": "OneTime", "endDateTime": "x"}) is False
+    # A consent field the response did not carry is not broad consent.
+    assert M.consent_breadth(M.MISSING) == "unset"
+    assert M.consent_breadth([]) == "restricted"
+    assert M.consent_breadth(["ManagePermissionGrantsForSelf.microsoft-user-default-legacy"]) == "broad"
+    assert M.consent_breadth(["ManagePermissionGrantsForSelf.microsoft-user-default-low"]) == "restricted"
+    assert M.consent_breadth(["abcdef"]) == "custom"
+    # A group without a resolved name is not printed twice.
+    assert M.group_node({"dyn_rules": {}}, "g1") == "group g1"
+    assert M.group_node({"dyn_rules": {"g1": ("Named", "rule")}}, "g1") == "group Named (g1)"
     # An undecided comparison books a denial, so the check cannot report ok.
     reset()
     M.CURRENT["check"] = "entra-cba-config"
@@ -959,6 +977,91 @@ def payloads():
                                          "preferredTokenSigningKeyThumbprint": COLON_THUMB,
                                          "keyCredentials": [{"customKeyIdentifier": HEX40}]}]},
          (), ("saml-pinned-key-missing",), None),
+        ("a role definition id that is a path still joins", "entra-escalation-roles", {"subs": [], "idx": idx},
+         {"graph_all": lambda p, *a, **k: (
+             [{"id": "d1", "templateId": ga, "displayName": "Global Administrator"}]
+             if "roleDefinitions" in p else
+             [{"principalId": "p1", "roleDefinitionId": "/roleManagement/directory/roleDefinitions/d1"}])},
+         ("escalation-role-holders",), (), lambda: any("Global Administrator" in f["subject"]
+                                                       for f in evidence("escalation-role-holders"))),
+        ("a permanent schedule instance is a standing grant", "entra-standing-global-admin", {"subs": []},
+         {"graph_all": lambda p, *a, **k: (
+             [{"id": "d1", "templateId": ga, "displayName": "Global Administrator"}]
+             if "roleDefinitions" in p else
+             [{"principalId": "p1", "roleDefinitionId": "d1", "assignmentType": "Permanent",
+               "endDateTime": None}])},
+         ("standing-global-administrator",), ("no-standing-global-administrator",), None),
+        ("a bounded schedule instance is not standing", "entra-standing-global-admin", {"subs": []},
+         {"graph_all": lambda p, *a, **k: (
+             [{"id": "d1", "templateId": ga, "displayName": "Global Administrator"}]
+             if "roleDefinitions" in p else
+             [{"principalId": "p1", "roleDefinitionId": "d1", "assignmentType": "Limited",
+               "endDateTime": "2999-01-01T00:00:00Z"}])},
+         ("no-standing-global-administrator",), ("standing-global-administrator",), None),
+        ("a permanent role with no eligibility path is reported", "entra-pim-depth", {"subs": []},
+         {"graph_all": lambda p, *a, **k: (
+             [] if "roleEligibilityScheduleInstances" in p else
+             [{"roleDefinitionId": "d1", "assignmentType": "Permanent"}])},
+         ("role-permanent-no-eligible-path",), (), None),
+        ("a synced account in a routine role is not an administrative path", "entra-synced-admins",
+         {"subs": [], "idx": M.Index([{"kind": "AZUser", "id": "u1",
+                                       "properties": {"displayName": "S", "userPrincipalName": "s@x",
+                                                      "onPremisesSyncEnabled": True}}])},
+         {"graph_all": lambda p, *a, **k: (
+             [{"id": "d9", "templateId": "88d8e3e3-8f55-4a1e-953a-9b9898b8876b", "displayName": "Guest Inviter"}]
+             if "roleDefinitions" in p else
+             [{"principalId": "u1", "roleDefinitionId": "d9"}])},
+         (), ("synced-account-holds-role",), None),
+        ("a read action on a privileged area is not an escalation action", "entra-custom-roles", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"id": "c1", "displayName": "Auditor", "rolePermissions": [
+             {"allowedResourceActions": ["microsoft.directory/rolemanagement/roledefinitions/read",
+                                         "microsoft.directory/users/authenticationmethods/read"]}]}]},
+         (), ("custom-role-escalation-action",), None),
+        ("a write action on a privileged area is an escalation action", "entra-custom-roles", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"id": "c1", "displayName": "Helper", "rolePermissions": [
+             {"allowedResourceActions": ["microsoft.directory/rolemanagement/roleassignments/update"]}]}]},
+         ("custom-role-escalation-action",), (), None),
+        ("the renewal policy is read from the policy endpoint", "sub-kv-cert-contacts", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "kv", "subscriptionId": "s1", "rg": "rg"}],
+          "az": lambda *a, **k: ({"value": [{"id": "/certificates/c1"}]} if "/certificates?" in str(a)
+                                 else {"attributes": {"enabled": True},
+                                       "lifetimeActions": [{"action": {"actionType": "AutoRenew"}}]})},
+         (), ("kv-cert-no-autorenew",), None),
+        ("an unread renewal policy is not an expiring certificate", "sub-kv-cert-contacts", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "kv", "subscriptionId": "s1", "rg": "rg"}],
+          "az": lambda *a, **k: {"value": [{"id": "/certificates/c1"}]} if "/certificates?" in str(a) else None},
+         ("kv-cert-policy-unreadable",), ("kv-cert-no-autorenew",), None),
+        ("an absent consent assignment is not broad consent", "entra-consent-grant-policy", {"subs": []},
+         {"graph_all": lambda *a, **k: [],
+          "graph": lambda *a, **k: {"defaultUserRolePermissions": {}}},
+         ("consent-policy-unresolved",), ("no-consent-grant-policy",), None),
+        ("the legacy default grant policy is broad consent", "entra-consent-grant-policy", {"subs": []},
+         {"graph_all": lambda *a, **k: [],
+          "graph": lambda *a, **k: {"defaultUserRolePermissions": {
+              "permissionGrantPoliciesAssigned": ["ManagePermissionGrantsForSelf.microsoft-user-default-legacy"]}}},
+         ("no-consent-grant-policy",), ("consent-restricted-by-default",), None),
+        ("an empty assignment list denies user consent", "entra-consent-grant-policy", {"subs": []},
+         {"graph_all": lambda *a, **k: [],
+          "graph": lambda *a, **k: {"defaultUserRolePermissions": {"permissionGrantPoliciesAssigned": []}}},
+         ("consent-restricted-by-default",), ("no-consent-grant-policy",), None),
+        ("an unread sign-in activity is not a dormant guest", "entra-dormant-guests", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"id": "g1", "userPrincipalName": "g@x"}]},
+         ("guest-activity-unread",), ("guest-never-signed-in", "guest-dormant"), None),
+        ("a guest that carries a null sign-in never signed in", "entra-dormant-guests", {"subs": []},
+         {"graph_all": lambda *a, **k: [{"id": "g1", "userPrincipalName": "g@x",
+                                         "signInActivity": {"lastSignInDateTime": None}}]},
+         ("guest-never-signed-in",), ("guest-activity-unread",), None),
+        ("the directory policy assignments are matched per role", "entra-pim-role-settings", {"subs": []},
+         {"graph_all": lambda p, *a, **k: (
+             [{"id": "d1", "templateId": ga, "displayName": "Global Administrator"}]
+             if "roleDefinitions" in p else
+             [{"roleDefinitionId": "/roleManagement/directory/roleDefinitions/d1",
+               "policy": {"rules": [{"@odata.type": "#microsoft.graph.unifiedRoleManagementPolicyApprovalRule",
+                                     "setting": {"isApprovalRequired": True}}]}}])},
+         ("pim-role-approved",), ("pim-role-no-approval",), None),
+        ("an absent management group ancestry is not a root subscription", "sub-mg-default-membership", {"subs": ["s1"]},
+         {"arg_rows": lambda *a, **k: [{"name": "sub", "id": "/subscriptions/s1", "chain": None}]},
+         ("mg-chain-unreadable",), ("subscription-at-tenant-root",), None),
     ]
     fails = []
     try:
