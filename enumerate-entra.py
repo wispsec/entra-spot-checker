@@ -314,7 +314,8 @@ def _tally_transport(data=None, kind=None, truncated=False, count_call=True):
 
 
 ABSENT_TOKENS = ("resourcenotfound", "resource not found for the segment", "not applicable to target tenant",
-                 "no http resource was found", "account is not provisioned", "missingprovider",
+                 "no http resource was found", "account is not provisioned", "missingprovider", "invalidresourcetype",
+                 "resource type could not be found",
                  "aadb2c", "authentication_requestfromnonpremiumtenantorb2ctenant")
 DENIED_TOKENS = ("(403", "forbidden", "authorizationfailed", "does not have authorization", "accessdenied",
                  "authorization_requestdenied", "unauthorized", "authorization_error", "permissionscopenotgranted",
@@ -942,6 +943,11 @@ def per_sub(subs, path, api, pick):
             LAST_QUERY[CURRENT["check"]] = "az rest --url " + repr(url)
         doc = az(["rest", "--url", url])
         if doc is None:
+            out[s] = None
+            continue
+        if not isinstance(doc, dict):
+            LAST_ERROR.update(kind="error", detail="response was not an object")
+            _tally_transport(kind="error")
             out[s] = None
             continue
         items = pick(doc)
@@ -5350,7 +5356,7 @@ def c_mg(ctx):
         capped("sub-management-groups", len(groups), "management group pages")
     note("sub-management-groups", len(groups))
     for g in groups:
-        add("info", "management-group", g.get("name"), "displayName=" + str((g.get("properties") or {}).get("displayName")), "hierarchy level; inherited assignments apply to every child")
+        add("info", "management-group", g.get("name"), "displayName=" + str((g.get("properties") or {}).get("displayName")), "hierarchy level; inherited assignments apply to every child", "tenant")
     if not groups:
         add("info", "no-management-groups", "tenant", "0 management groups", "all subscriptions are flat")
 
@@ -6271,7 +6277,7 @@ def c_policy_depth(ctx):
         add("medium", "policy-effect-disabled", r.get("name"), "effect=Disabled", "definition never evaluates", r.get("subscriptionId"))
     audit = arg_rows("PolicyResources | where type =~ 'microsoft.authorization/policydefinitions' | where subscriptionId in (" + subq(ctx["subs"]) + ") or isempty(tostring(subscriptionId)) | where tostring(properties.policyRule.then.effect) == 'Audit' | summarize n=count() by subscriptionId", ctx["subs"], scoped=False)
     for r in unread_list(audit, "audit-only policy definitions", "policy-audit-definitions-unreadable"):
-        add("info", "policy-audit-only", r.get("subscriptionId"), "definitions=" + str(r.get("n")), "audit-only definitions do not block")
+        add("info", "policy-audit-only", r.get("subscriptionId"), "definitions=" + str(r.get("n")), "audit-only definitions do not block", r.get("subscriptionId"))
 
 
 @check("sub-backup-items")
@@ -6482,7 +6488,7 @@ def c_alert_content(ctx):
     }
     for label, tokens in wanted.items():
         if not any(t in blob for blob in watched for t in tokens):
-            add("medium", "alert-coverage-gap", label, "no rule condition matches", "this event class raises no alert")
+            add("medium", "alert-coverage-gap", label, "no rule condition matches", "this event class raises no alert", "tenant")
 
 
 @check("sub-appservice-auth")
@@ -6522,7 +6528,7 @@ def c_net_inv(ctx):
     note("sub-network-inventory", len(rows))
     kinds = Counter(str(r.get("type")).split("/")[-1] for r in rows)
     for k, v in kinds.items():
-        add("info", "network-component", k, "count=" + str(v), "network trust component inventory")
+        add("info", "network-component", k, "count=" + str(v), "network trust component inventory", "tenant")
     if not kinds.get("ddosprotectionplans"):
         add("low", "no-ddos-plan", "all", "0 DDoS protection plans", "public endpoints rely on platform protection only")
 
@@ -6861,7 +6867,7 @@ def c_rbac_breadth(ctx):
         else:
             depth["managementGroupOrRoot"] += 1
     for k, v in depth.items():
-        add("info", "rbac-scope-depth", k, "assignments=" + str(v), "assignment scope distribution")
+        add("info", "rbac-scope-depth", k, "assignments=" + str(v), "assignment scope distribution", "tenant")
     for r in rows:
         sc = str(r.get("scope") or "")
         if "/resourceGroups/" in sc and "/providers/" in sc:
@@ -7030,7 +7036,7 @@ def c_routes(ctx):
         if hop in ("Internet", "None"):
             add("medium", "route-default-to-internet", r.get("name"), "route=" + str(r.get("route")) + " nextHop=" + hop, "all egress bypasses inspection", r.get("subscriptionId"))
         else:
-            add("info", "route-default-captured", r.get("name"), "route=" + str(r.get("route")) + " nextHop=" + hop, "default route is captured by an appliance")
+            add("info", "route-default-captured", r.get("name"), "route=" + str(r.get("route")) + " nextHop=" + hop, "default route is captured by an appliance", r.get("subscriptionId"))
 
 
 @check("sub-appservice-net")
@@ -7744,17 +7750,17 @@ def c_securescore(ctx):
     for r in scores:
         cur, mx = dig(r, "current"), dig(r, "max")
         if not isinstance(cur, (int, float)) or not isinstance(mx, (int, float)) or not mx:
-            add("low", "secure-score-unparsed", dig(r, "subscriptionId"), "score fields absent", "secure score cannot be computed")
+            add("low", "secure-score-unparsed", dig(r, "subscriptionId"), "score fields absent", "secure score cannot be computed", dig(r, "subscriptionId"))
             continue
         pct = cur / mx * 100.0
-        add("medium" if pct < 50 else "info", "defender-secure-score", dig(r, "subscriptionId"), "score=%.1f%% (%.1f/%.1f)" % (pct, cur, mx), "secure score below half of the maximum" if pct < 50 else "secure score")
+        add("medium" if pct < 50 else "info", "defender-secure-score", dig(r, "subscriptionId"), "score=%.1f%% (%.1f/%.1f)" % (pct, cur, mx), "secure score below half of the maximum" if pct < 50 else "secure score", dig(r, "subscriptionId"))
     stds = unread(arg_rows("Resources | where type =~ 'microsoft.security/regulatorycompliancestandards' | summarize n=count() by subscriptionId", ctx["subs"]),
                   "regulatory compliance standards", "compliance-standards-unreadable")
     if stds is not None:
         have = {str(dig(x, "subscriptionId")) for x in stds}
         for s in ctx["subs"]:
             if s not in have:
-                add("low", "no-regulatory-standard", s, "0 regulatory compliance standards", "no compliance baseline is tracked")
+                add("low", "no-regulatory-standard", s, "0 regulatory compliance standards", "no compliance baseline is tracked", s)
 
 
 @check("sub-vm-host-encryption")
@@ -8132,9 +8138,7 @@ def c_adf(ctx):
 def c_dcr(ctx):
     q = (
         "Resources | where type =~ 'microsoft.insights/datacollectionrules'"
-        " | extend ident=tostring(identity.type)"
-        " | mv-apply d = properties.dataSources on (summarize syslog=countif(tolower(tostring(d.kind)) == 'syslog'))"
-        " | project name, subscriptionId, ident, syslog"
+        " | project name, subscriptionId, ident=tostring(identity.type), sources=properties.dataSources"
     )
     rows = arg_rows(q, ctx["subs"])
     if rows is None:
@@ -8145,8 +8149,10 @@ def c_dcr(ctx):
         name = str(dig(r, "name"))
         if not dig(r, "ident"):
             add("low", "dcr-no-identity", name, "identity.type=none", "the rule writes to a workspace without its own identity", str(dig(r, "subscriptionId")))
-        if dig(r, "syslog"):
-            add("info", "dcr-syslog", name, "syslogDataSources=" + str(dig(r, "syslog")), "syslog collection widens the log injection surface", str(dig(r, "subscriptionId")))
+        sources = dig(r, "sources")
+        kinds = [str(dig(s, "kind")).lower() for s in sources] if isinstance(sources, list) else []
+        if "syslog" in kinds:
+            add("info", "dcr-syslog", name, "syslogDataSources=" + str(kinds.count("syslog")), "syslog collection widens the log injection surface", str(dig(r, "subscriptionId")))
 
 
 @check("sub-security-settings")
