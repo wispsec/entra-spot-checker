@@ -3138,6 +3138,7 @@ def c_dyn(ctx):
     caps, blind = _group_capabilities(ctx, [g for g, (s, _a) in steers.items() if s != "fixed"])
     ctx["caps"] = caps
     ctx["caps_blind"] = blind
+    unread_steers = []
     for gid, (name, rule, state) in groups.items():
         label = name or gid
         steer, attrs = steers[gid]
@@ -3145,8 +3146,7 @@ def c_dyn(ctx):
             add("low", "dynamic-group-processing-paused", label, "membershipRuleProcessingState=Paused", "membership is frozen; the rule no longer decides who is in the group")
         grants = sorted(caps.get(gid, []), reverse=True)
         if not grants and gid in blind:
-            undecided("dynamic-group-grant-unread", "group=" + label + " steer=" + steer + " rule=" + rule[:80],
-                      "what membership grants was not read, so the severity of this steer is not decided")
+            unread_steers.append(label + " steer=" + steer)
             continue
         top = grants[0][0] if grants else 0
         if steer in STEER_OPEN:
@@ -3172,6 +3172,9 @@ def c_dyn(ctx):
                     continue
                 chain("dynamic-group-to-capability", segment + " -> " + group_node(ctx, gid) + " -> " + sink,
                       sink_sev, "a rule an outsider can satisfy grants this access")
+    if unread_steers:
+        undecided("dynamic-group-grant-unread", "groups=" + "; ".join(unread_steers[:3]) + (" +" + str(len(unread_steers) - 3) if len(unread_steers) > 3 else ""),
+                  "what membership grants was not read, so the severity of these steers is not decided")
 
 
 @check("entra-attribute-writers")
@@ -8437,6 +8440,9 @@ def c_security_settings(ctx):
         for required in ("wdatp", "mcas", "sentinel"):
             if required not in seen:
                 add("low", "security-setting-absent", required, "0 settings named " + required + " subscription=" + s, "the integration is not configured for this subscription", s)
+    silent = [s for s in ctx["subs"] if s not in by_sub]
+    if silent:
+        add("info", "security-settings-none", "all", "subscriptions=" + ",".join(silent[:5]) + (" +" + str(len(silent) - 5) if len(silent) > 5 else ""), "no microsoft.security/settings resource exists in these subscriptions, so no integration is configured there")
     for r in rows:
         if tri(dig(r, "enabled")) is False:
             add("medium", "security-setting-disabled", dig(r, "name"), "enabled=false", "integration is present but switched off", str(dig(r, "subscriptionId")))
@@ -9071,7 +9077,6 @@ def c_sspr(ctx):
     else:
         add("info", "sspr-methods", "tenant", "resetMethods=" + ",".join(reset_methods), "self-service reset methods in force")
     if authz is None:
-        deny("entra-sspr")
         undecided("sspr-admin-reset-unread", "authorizationPolicy unreadable", "whether administrators may reset their own password was not decided")
         return
     admin_reset = tri(dig(authz, "defaultUserRolePermissions.allowedToUseSSPR"))
@@ -9988,7 +9993,6 @@ def c_xtenant_escalation(ctx):
     default_policy = graph("policies/crossTenantAccessPolicy/default", beta=True)
     inherited_inbound = str(val(dig(default_policy, "b2bCollaborationInbound.usersAndGroups.accessType"), "")).lower()
     if default_policy is None:
-        deny("entra-cross-tenant-escalation")
         undecided("cross-tenant-inbound-unread", "default cross-tenant policy unread", "an unset partner inbound inherits this policy, so trust bypass is not decided")
     trusted = []
     for p in lst(partners):
@@ -10436,7 +10440,6 @@ def c_breakglass_hardening(ctx):
     enabled_policies = 0
     excluded_known = pols is not None
     if not excluded_known:
-        deny("entra-breakglass-hardening")
         undecided("breakglass-exclusion-unread", "conditional access policies unread", "whether the emergency accounts are excluded from enforced policies was not decided")
     for p in lst(pols):
         if str(dig(p, "state")) == "enabled":
